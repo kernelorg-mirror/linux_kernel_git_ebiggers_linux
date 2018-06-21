@@ -2976,6 +2976,12 @@ static const struct alg_test_desc alg_test_descs[] = {
 			.cipher = __VECS(khazad_tv_template)
 		}
 	}, {
+		.alg = "ecb(lea)",
+		.test = alg_test_skcipher,
+		.suite = {
+			.cipher = __VECS(lea_tv_template)
+		}
+	}, {
 		/* Same as ecb(aes) except the key is stored in
 		 * hardware secure memory which we reference by index
 		 */

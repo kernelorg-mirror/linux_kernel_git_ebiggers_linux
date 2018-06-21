@@ -1424,6 +1424,19 @@ config CRYPTO_KHAZAD
 	  See also:
 	  <http://www.larc.usp.br/~pbarreto/KhazadPage.html>
 
+config CRYPTO_LEA
+	tristate "LEA cipher algorithm"
+	select CRYPTO_ALGAPI
+	help
+	  LEA is a lightweight block cipher that is tuned for optimal
+	  performance in software (rather than hardware).
+
+	  While still unbroken, LEA hasn't yet undergone as much cryptanalysis
+	  as AES.  Thus, it's suggested to only use it on systems where AES
+	  isn't fast enough.
+
+	  If unsure, say N.
+
 config CRYPTO_SALSA20
 	tristate "Salsa20 stream cipher algorithm"
 	select CRYPTO_BLKCIPHER
