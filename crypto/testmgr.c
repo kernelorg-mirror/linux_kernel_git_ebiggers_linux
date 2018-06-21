@@ -3533,6 +3533,12 @@ static const struct alg_test_desc alg_test_descs[] = {
 			.cipher = __VECS(cast6_xts_tv_template)
 		}
 	}, {
+		.alg = "xts(lea)",
+		.test = alg_test_skcipher,
+		.suite = {
+			.cipher = __VECS(lea_xts_tv_template)
+		}
+	}, {
 		/* Same as xts(aes) except the key is stored in
 		 * hardware secure memory which we reference by index
 		 */
