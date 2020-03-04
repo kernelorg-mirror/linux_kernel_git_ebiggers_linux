@@ -2164,15 +2164,26 @@ struct aead_extra_tests_ctx {
 };
 
 /*
- * Make at least one random change to a (ciphertext, AAD) pair.  "Ciphertext"
- * here means the full ciphertext including the authentication tag.  The
- * authentication tag (and hence also the ciphertext) is assumed to be nonempty.
+ * Make at least one random change to a (IV, ciphertext, AAD) tuple.
+ * "Ciphertext" here means the full ciphertext including the authentication tag.
+ * The authentication tag (and hence also the ciphertext) is assumed to be
+ * nonempty.
  */
 static void mutate_aead_message(struct aead_testvec *vec, bool aad_iv,
 				unsigned int ivsize)
 {
 	const unsigned int aad_tail_size = aad_iv ? ivsize : 0;
 	const unsigned int authsize = vec->clen - vec->plen;
+
+	if (ivsize > 0 && prandom_u32() % 4 == 0) {
+		/* Mutate the IV */
+		flip_random_bit((u8 *)vec->iv, ivsize);
+		if (aad_iv && vec->alen >= ivsize)
+			memcpy((u8 *)vec->assoc + vec->alen - ivsize,
+			       vec->iv, ivsize);
+		if (prandom_u32() % 2 == 0)
+			return;
+	}
 
 	if (prandom_u32() % 2 == 0 && vec->alen > aad_tail_size) {
 		 /* Mutate the AAD */
@@ -2244,7 +2255,7 @@ static void generate_aead_message(struct aead_request *req,
 		if (!inauthentic)
 			return;
 		/*
-		 * Mutate the authentic (ciphertext, AAD) pair to get an
+		 * Mutate the authentic (IV, ciphertext, AAD) tuple to get an
 		 * inauthentic one.
 		 */
 		mutate_aead_message(vec, suite->aad_iv, ivsize);
