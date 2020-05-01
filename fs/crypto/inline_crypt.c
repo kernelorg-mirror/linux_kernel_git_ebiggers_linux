@@ -34,10 +34,10 @@ static int fscrypt_get_num_devices(struct super_block *sb)
 }
 
 static void fscrypt_get_devices(struct super_block *sb, int num_devs,
-				struct request_queue **devs)
+				struct block_device **devs)
 {
 	if (num_devs == 1)
-		devs[0] = bdev_get_queue(sb->s_bdev);
+		devs[0] = sb->s_bdev;
 	else
 		sb->s_cop->get_devices(sb, devs);
 }
@@ -70,7 +70,7 @@ int fscrypt_select_encryption_impl(struct fscrypt_info *ci)
 	struct super_block *sb = inode->i_sb;
 	struct blk_crypto_config crypto_cfg;
 	int num_devs;
-	struct request_queue **devs;
+	struct block_device **devs;
 	int i;
 
 	/* The file must need contents encryption, not filenames encryption */
@@ -112,7 +112,8 @@ int fscrypt_select_encryption_impl(struct fscrypt_info *ci)
 	fscrypt_get_devices(sb, num_devs, devs);
 
 	for (i = 0; i < num_devs; i++) {
-		if (!blk_crypto_config_supported(devs[i], &crypto_cfg))
+		if (!blk_crypto_config_supported(bdev_get_queue(devs[i]),
+						 &crypto_cfg))
 			goto out_free_devs;
 	}
 
@@ -133,6 +134,7 @@ int fscrypt_prepare_inline_crypt_key(struct fscrypt_prepared_key *prep_key,
 	int num_devs = fscrypt_get_num_devices(sb);
 	int queue_refs = 0;
 	struct fscrypt_blk_crypto_key *blk_key;
+	struct block_device **bdevs;
 	int err;
 	int i;
 	unsigned int flags;
@@ -140,9 +142,11 @@ int fscrypt_prepare_inline_crypt_key(struct fscrypt_prepared_key *prep_key,
 	blk_key = kzalloc(struct_size(blk_key, devs, num_devs), GFP_NOFS);
 	if (!blk_key)
 		return -ENOMEM;
+	BUILD_BUG_ON(sizeof(blk_key->devs[0]) != sizeof(struct block_device *));
+	bdevs = (struct block_device **)blk_key->devs;
 
 	blk_key->num_devs = num_devs;
-	fscrypt_get_devices(sb, num_devs, blk_key->devs);
+	fscrypt_get_devices(sb, num_devs, bdevs);
 
 	err = blk_crypto_init_key(&blk_key->base, raw_key, crypto_mode,
 				  fscrypt_get_dun_bytes(ci), sb->s_blocksize);
@@ -159,16 +163,19 @@ int fscrypt_prepare_inline_crypt_key(struct fscrypt_prepared_key *prep_key,
 	 * (namely, the per-mode keys in struct fscrypt_master_key).
 	 */
 	for (i = 0; i < num_devs; i++) {
-		if (!blk_get_queue(blk_key->devs[i])) {
+		struct block_device *bdev = bdevs[i];
+		struct request_queue *q = bdev_get_queue(bdev);
+
+		if (!blk_get_queue(q)) {
 			fscrypt_err(inode, "couldn't get request_queue");
 			err = -EAGAIN;
 			goto fail;
 		}
+		blk_key->devs[i] = q;
 		queue_refs++;
 
 		flags = memalloc_nofs_save();
-		err = blk_crypto_start_using_key(&blk_key->base,
-						 blk_key->devs[i]);
+		err = blk_crypto_start_using_key(&blk_key->base, bdev);
 		memalloc_nofs_restore(flags);
 		if (err) {
 			fscrypt_err(inode,

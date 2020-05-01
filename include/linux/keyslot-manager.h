@@ -54,7 +54,7 @@ struct blk_keyslot_manager {
 	 * size of (1 << i) is supported. We only support data unit sizes
 	 * that are powers of 2.
 	 */
-	unsigned int crypto_modes_supported[BLK_ENCRYPTION_MODE_MAX];
+	unsigned long crypto_modes_supported[BLK_ENCRYPTION_MODE_MAX];
 
 	/* Device for runtime power management (NULL if none) */
 	struct device *dev;
@@ -78,6 +78,9 @@ struct blk_keyslot_manager {
 	 */
 	struct hlist_head *slot_hashtable;
 	unsigned int log_slot_ht_size;
+
+	unsigned long crypto_modes_test_started[BLK_ENCRYPTION_MODE_MAX];
+	unsigned long crypto_modes_untested[BLK_ENCRYPTION_MODE_MAX];
 
 	/* Per-keyslot data */
 	struct blk_ksm_keyslot *slots;

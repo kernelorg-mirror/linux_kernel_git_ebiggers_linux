@@ -88,6 +88,8 @@ int blk_ksm_init(struct blk_keyslot_manager *ksm, unsigned int num_slots)
 		return -ENOMEM;
 
 	ksm->num_slots = num_slots;
+	memset(ksm->crypto_modes_untested, 0xFF,
+	       sizeof(ksm->crypto_modes_untested));
 
 	init_rwsem(&ksm->lock);
 
@@ -290,7 +292,7 @@ bool blk_ksm_crypto_cfg_supported(struct blk_keyslot_manager *ksm,
 {
 	if (!ksm)
 		return false;
-	if (!(ksm->crypto_modes_supported[cfg->crypto_mode] &
+	if (!(READ_ONCE(ksm->crypto_modes_supported[cfg->crypto_mode]) &
 	      cfg->data_unit_size))
 		return false;
 	if (ksm->max_dun_bytes_supported < cfg->dun_bytes)

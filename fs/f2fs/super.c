@@ -2509,14 +2509,13 @@ static int f2fs_get_num_devices(struct super_block *sb)
 	return 1;
 }
 
-static void f2fs_get_devices(struct super_block *sb,
-			     struct request_queue **devs)
+static void f2fs_get_devices(struct super_block *sb, struct block_device **devs)
 {
 	struct f2fs_sb_info *sbi = F2FS_SB(sb);
 	int i;
 
 	for (i = 0; i < sbi->s_ndevs; i++)
-		devs[i] = bdev_get_queue(FDEV(i).bdev);
+		devs[i] = FDEV(i).bdev;
 }
 
 static const struct fscrypt_operations f2fs_cryptops = {

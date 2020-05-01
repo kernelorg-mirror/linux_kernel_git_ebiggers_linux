@@ -70,8 +70,7 @@ struct fscrypt_operations {
 	void (*get_ino_and_lblk_bits)(struct super_block *sb,
 				      int *ino_bits_ret, int *lblk_bits_ret);
 	int (*get_num_devices)(struct super_block *sb);
-	void (*get_devices)(struct super_block *sb,
-			    struct request_queue **devs);
+	void (*get_devices)(struct super_block *sb, struct block_device **devs);
 };
 
 static inline struct fscrypt_info *fscrypt_get_info(const struct inode *inode)

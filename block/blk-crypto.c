@@ -356,7 +356,7 @@ bool blk_crypto_config_supported(struct request_queue *q,
 /**
  * blk_crypto_start_using_key() - Start using a blk_crypto_key on a device
  * @key: A key to use on the device
- * @q: the request queue for the device
+ * @bdev: the device
  *
  * Upper layers must call this function to ensure that either the hardware
  * supports the key's crypto settings, or the crypto API fallback has transforms
@@ -369,10 +369,20 @@ bool blk_crypto_config_supported(struct request_queue *q,
  *	   is disabled in the crypto API; or another -errno code.
  */
 int blk_crypto_start_using_key(const struct blk_crypto_key *key,
-			       struct request_queue *q)
+			       struct block_device *bdev)
 {
-	if (blk_ksm_crypto_cfg_supported(q->ksm, &key->crypto_cfg))
-		return 0;
+	struct blk_keyslot_manager *ksm = bdev_get_queue(bdev)->ksm;
+	int err;
+
+	if (blk_ksm_crypto_cfg_supported(ksm, &key->crypto_cfg)) {
+		/*
+		 * Only allow inline encryption hardware to be used if it passes
+		 * the self-test.
+		 */
+		err = blk_crypto_selftest(bdev, &key->crypto_cfg);
+		if (!err)
+			return 0;
+	}
 	return blk_crypto_fallback_start_using_mode(key->crypto_cfg.crypto_mode);
 }
 
