@@ -1,0 +1,40 @@
+#!/bin/bash
+#
+# This script builds a kernel for Sony Xperia 10, replaces the kernel in a TWRP
+# recovery image with it, and flashes that image to the device.
+#
+# Prerequisites:
+#    - Set LINUX_DIR correctly below
+#
+#    - Download TWRP from https://dl.twrp.me/kirin/twrp-3.4.0-1-kirin.img
+#      (sha256 f0457425fcbc63497c125ae98e5a21a9e72f23e021d66bff96c849e2c7c5e217)
+#      and set TWRP below to the location of this file.
+#
+#    - Install prerequisite packages.  On Ubuntu, the following should work:
+#      sudo apt-get install fastboot abootimg gcc-aarch64-linux-gnu
+#
+#    - Put the device in fastboot mode.  To do this at any time, hold down
+#      "power" and "volume up" until there are three consecutive vibrations.
+#      Then quickly release those buttons and hold down "volume down".
+
+set -euo pipefail
+
+LINUX_DIR=$HOME/src/linux
+TWRP=$HOME/os/twrp-3.4.0-1-kirin.img
+
+cd "$LINUX_DIR"
+export ARCH=arm64
+export CROSS_COMPILE=aarch64-linux-gnu-
+make ganges_defconfig
+make "-j$(getconf _NPROCESSORS_ONLN)"
+
+cat arch/arm64/boot/Image.gz \
+    arch/arm64/boot/dts/qcom/sdm630-sony-xperia-ganges-kirin.dtb \
+    > Image.gz-dtb
+
+cp "$TWRP" boot.img
+abootimg -u boot.img -k Image.gz-dtb
+
+fastboot set_active b
+fastboot flash boot_b boot.img
+fastboot continue
