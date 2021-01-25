@@ -310,6 +310,63 @@ static const struct imx219_reg mode_8mhz_4lane[] = {
 	{ IMX219_REG_PLL_VT_MULTIPLIER, 88, IMX219_REG_VALUE_16BIT, false },
 };
 
+static const struct imx219_reg mode_1920_1080_regs[] = {
+	{0x0100, 0x00},
+	{0x30eb, 0x05},
+	{0x30eb, 0x0c},
+	{0x300a, 0xff},
+	{0x300b, 0xff},
+	{0x30eb, 0x05},
+	{0x30eb, 0x09},
+	{0x0114, 0x01},
+	{0x0128, 0x00},
+	{0x012a, 0x18},
+	{0x012b, 0x00},
+	{0x0162, 0x0d},
+	{0x0163, 0x78},
+	{0x0164, 0x02},
+	{0x0165, 0xa8},
+	{0x0166, 0x0a},
+	{0x0167, 0x27},
+	{0x0168, 0x02},
+	{0x0169, 0xb4},
+	{0x016a, 0x06},
+	{0x016b, 0xeb},
+	{0x016c, 0x07},
+	{0x016d, 0x80},
+	{0x016e, 0x04},
+	{0x016f, 0x38},
+	{0x0170, 0x01},
+	{0x0171, 0x01},
+	{0x0174, 0x00},
+	{0x0175, 0x00},
+	{0x0301, 0x05},
+	{0x0303, 0x01},
+	{0x0304, 0x03},
+	{0x0305, 0x03},
+	{0x0306, 0x00},
+	{0x0307, 0x39},
+	{0x030b, 0x01},
+	{0x030c, 0x00},
+	{0x030d, 0x72},
+	{0x0624, 0x07},
+	{0x0625, 0x80},
+	{0x0626, 0x04},
+	{0x0627, 0x38},
+	{0x455e, 0x00},
+	{0x471e, 0x4b},
+	{0x4767, 0x0f},
+	{0x4750, 0x14},
+	{0x4540, 0x00},
+	{0x47b4, 0x14},
+	{0x4713, 0x30},
+	{0x478b, 0x10},
+	{0x478f, 0x10},
+	{0x4793, 0x10},
+	{0x4797, 0x0e},
+	{0x479b, 0x0e},
+};
+
 /* Please select BANK OFFSET */
 static const struct imx219_reg mode_3280x2464[] = {
 	/* MAX: 4-Lane @ 30FPS - 2-Lane @ 15FPS */
@@ -529,8 +586,8 @@ static const struct imx219_mode supported_modes[] = {
 		.height = 2464,
 		.max_fps = 30,
 		.crop = {
-			.left = 0,
-			.top = 0,
+			.left = IMX219_PIXEL_ARRAY_LEFT,
+			.top = IMX219_PIXEL_ARRAY_TOP,
 			.width = 3280,
 			.height = 2464
 		},
@@ -546,8 +603,8 @@ static const struct imx219_mode supported_modes[] = {
 		.height = 1080,
 		.max_fps = 60,
 		.crop = {
-			.left = 680,
-			.top = 692,
+			.left = 688,
+			.top = 700,
 			.width = 1920,
 			.height = 1080
 		},
@@ -564,10 +621,10 @@ static const struct imx219_mode supported_modes[] = {
 		.height = 1232,
 		.max_fps = 30,
 		.crop = {
-			.left = 0,
-			.top = 0,
-			.width = 1640,
-			.height = 1232
+			.left = IMX219_PIXEL_ARRAY_LEFT,
+			.top = IMX219_PIXEL_ARRAY_TOP,
+			.width = 3280,
+			.height = 2464
 		},
 		.vts_def = IMX219_VTS_30FPS_BINNED,
 		.reg_list = {
@@ -1218,6 +1275,7 @@ static int imx219_get_selection(struct v4l2_subdev *sd,
 		return 0;
 
 	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
 		sel->r.top = IMX219_PIXEL_ARRAY_TOP;
 		sel->r.left = IMX219_PIXEL_ARRAY_LEFT;
 		sel->r.width = IMX219_PIXEL_ARRAY_WIDTH;
@@ -1420,22 +1478,21 @@ err_unlock:
 /* Power/clock management functions */
 static int imx219_power_on(struct device *dev)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct imx219 *imx219 = to_imx219(sd);
 	int ret;
 
 	ret = regulator_bulk_enable(IMX219_NUM_SUPPLIES,
 				    imx219->supplies);
 	if (ret) {
-		dev_err(&client->dev, "%s: failed to enable regulators\n",
+		dev_err(dev, "%s: failed to enable regulators\n",
 			__func__);
 		return ret;
 	}
 
 	ret = clk_prepare_enable(imx219->xclk);
 	if (ret) {
-		dev_err(&client->dev, "%s: failed to enable clock\n",
+		dev_err(dev, "%s: failed to enable clock\n",
 			__func__);
 		goto reg_off;
 	}
@@ -1454,8 +1511,7 @@ reg_off:
 
 static int imx219_power_off(struct device *dev)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct imx219 *imx219 = to_imx219(sd);
 
 	gpiod_set_value_cansleep(imx219->reset_gpio, 0);
@@ -1467,8 +1523,7 @@ static int imx219_power_off(struct device *dev)
 
 static int __maybe_unused imx219_suspend(struct device *dev)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct imx219 *imx219 = to_imx219(sd);
 
 	if (imx219->streaming)
@@ -1479,8 +1534,7 @@ static int __maybe_unused imx219_suspend(struct device *dev)
 
 static int __maybe_unused imx219_resume(struct device *dev)
 {
-	struct i2c_client *client = to_i2c_client(dev);
-	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct imx219 *imx219 = to_imx219(sd);
 	int ret;
 
@@ -1821,7 +1875,8 @@ static int imx219_probe(struct i2c_client *client)
 
 	/* Initialize subdev */
 	imx219->sd.internal_ops = &imx219_internal_ops;
-	imx219->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+	imx219->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+			    V4L2_SUBDEV_FL_HAS_EVENTS;
 	imx219->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
 
 	/* Initialize source pad */

@@ -1221,9 +1221,8 @@ int msm_ispif_subdev_init(struct ispif_device *ispif,
 
 	mutex_init(&ispif->config_lock);
 
-	for (i = 0; i < MSM_ISPIF_VFE_NUM; i++) {
+	for (i = 0; i < MSM_ISPIF_VFE_NUM; i++)
 		init_completion(&ispif->reset_complete[i]);
-	}
 
 	return 0;
 }

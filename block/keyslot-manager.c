@@ -29,6 +29,7 @@
 #define pr_fmt(fmt) "blk-crypto: " fmt
 
 #include <linux/keyslot-manager.h>
+#include <linux/device.h>
 #include <linux/atomic.h>
 #include <linux/mutex.h>
 #include <linux/pm_runtime.h>
@@ -103,6 +104,13 @@ int blk_ksm_init(struct blk_keyslot_manager *ksm, unsigned int num_slots)
 	spin_lock_init(&ksm->idle_slots_lock);
 
 	slot_hashtable_size = roundup_pow_of_two(num_slots);
+	/*
+	 * hash_ptr() assumes bits != 0, so ensure the hash table has at least 2
+	 * buckets.  This only makes a difference when there is only 1 keyslot.
+	 */
+	if (slot_hashtable_size < 2)
+		slot_hashtable_size = 2;
+
 	ksm->log_slot_ht_size = ilog2(slot_hashtable_size);
 	ksm->slot_hashtable = kvmalloc_array(slot_hashtable_size,
 					     sizeof(ksm->slot_hashtable[0]),
@@ -119,6 +127,34 @@ err_destroy_ksm:
 	return -ENOMEM;
 }
 EXPORT_SYMBOL_GPL(blk_ksm_init);
+
+static void blk_ksm_destroy_callback(void *ksm)
+{
+	blk_ksm_destroy(ksm);
+}
+
+/**
+ * devm_blk_ksm_init() - Resource-managed blk_ksm_init()
+ * @dev: The device which owns the blk_keyslot_manager.
+ * @ksm: The blk_keyslot_manager to initialize.
+ * @num_slots: The number of key slots to manage.
+ *
+ * Like blk_ksm_init(), but causes blk_ksm_destroy() to be called automatically
+ * on driver detach.
+ *
+ * Return: 0 on success, or else a negative error code.
+ */
+int devm_blk_ksm_init(struct device *dev, struct blk_keyslot_manager *ksm,
+		      unsigned int num_slots)
+{
+	int err = blk_ksm_init(ksm, num_slots);
+
+	if (err)
+		return err;
+
+	return devm_add_action_or_reset(dev, blk_ksm_destroy_callback, ksm);
+}
+EXPORT_SYMBOL_GPL(devm_blk_ksm_init);
 
 static inline struct hlist_head *
 blk_ksm_hash_bucket_for_key(struct blk_keyslot_manager *ksm,

@@ -1165,6 +1165,8 @@ static void vfe48_wm_enable(struct vfe_device *vfe, u8 wm, u8 enable)
 	else
 		writel_relaxed(1 << VFE48_0_BUS_IMAGE_MASTER_n_SHIFT(wm),
 			       vfe->base + VFE48_0_BUS_IMAGE_MASTER_CMD);
+
+	/* The WM must be enabled before sending other commands */
 	wmb();
 }
 
