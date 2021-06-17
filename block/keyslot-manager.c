@@ -437,12 +437,97 @@ void blk_ksm_destroy(struct blk_keyslot_manager *ksm)
 }
 EXPORT_SYMBOL_GPL(blk_ksm_destroy);
 
+/*
+ * Return the largest crypto data unit size that can be used on the given disk
+ * based on its I/O limitations.  This doesn't look at what data unit size(s)
+ * are actually supported; this just returns the maximum based on other factors.
+ */
+static unsigned int blk_ksm_get_max_valid_dusize(struct request_queue *q)
+{
+	const struct queue_limits *limits = &q->limits;
+	const unsigned int lbs = queue_logical_block_size(q);
+	/* The largest possible data unit size we support is PAGE_SIZE. */
+	unsigned int max_dusize = PAGE_SIZE;
+
+	/*
+	 * If the queue doesn't support SG gaps, then a bio may have to be split
+	 * between any two bio_vecs.  Since the size of each bio_vec is only
+	 * guaranteed to be a multiple of logical_block_size, logical_block_size
+	 * is also the maximum crypto data unit size that can be supported in
+	 * this case, as bios must not be split in the middle of a data unit.
+	 */
+	if (limits->virt_boundary_mask)
+		max_dusize = min(max_dusize, lbs);
+
+	/*
+	 * Similarly, if chunk_sectors is set and a bio is submitted that
+	 * crosses a chunk boundary, then that bio may have to be split at a
+	 * boundary that is only logical_block_size aligned.  So that limits the
+	 * crypto data unit size to logical_block_size as well.
+	 */
+	if (limits->chunk_sectors)
+		max_dusize = min(max_dusize, lbs);
+
+	/*
+	 * Each bvec can be as small as logical_block_size.  Therefore the
+	 * crypto data unit size can't be greater than 'max_segments *
+	 * logical_block_size', as otherwise in the worst case there would be no
+	 * way to process the first data unit without exceeding max_segments.
+	 */
+	max_dusize = min_t(unsigned long, max_dusize,
+			    rounddown_pow_of_two(limits->max_segments) * lbs);
+
+	return max_dusize;
+}
+
+/**
+ * blk_ksm_register() - Assign a keyslot manager to a request queue, if possible
+ * @ksm: The ksm to register
+ * @q: The request_queue to register the ksm with
+ *
+ * Set @q->ksm to @ksm if @ksm's crypto capabilities are compatible (fully or
+ * partially) with @q.  If the capabilities of @ksm are only partially
+ * compatible with @q, then any incompatible ones will be cleared from @ksm.
+ *
+ * Return: %true if @q->ksm was set, otherwise %false.  %false means that
+ *         none of the crypto capabilities are compatible with @q at all.
+ */
 bool blk_ksm_register(struct blk_keyslot_manager *ksm, struct request_queue *q)
 {
+	const char *name = queue_to_disk(q)->disk_name;
+	unsigned int max_dusize;
+	unsigned int valid_dusize_mask;
+	bool have_invalid_dusizes = false;
+	bool have_valid_dusizes = false;
+	int i;
+
+	/* Currently blk-crypto and blk-integrity are incompatible. */
 	if (blk_integrity_queue_supports_integrity(q)) {
-		pr_warn("Integrity and hardware inline encryption are not supported together. Disabling hardware inline encryption.\n");
+		pr_warn("%s: Integrity and inline encryption are incompatible. Disabling inline encryption.\n",
+			name);
 		return false;
 	}
+
+	/* Device limitations can limit the maximum data unit size. */
+	max_dusize = blk_ksm_get_max_valid_dusize(q);
+	valid_dusize_mask = max_dusize - 1;
+	for (i = 0; i < ARRAY_SIZE(ksm->crypto_modes_supported); i++) {
+		if (ksm->crypto_modes_supported[i] & valid_dusize_mask)
+			have_valid_dusizes = true;
+		if (ksm->crypto_modes_supported[i] & ~valid_dusize_mask)
+			have_invalid_dusizes = true;
+	}
+	if (have_invalid_dusizes)
+		pr_warn("%s: Crypto data unit sizes above %u bytes can't be used due to device I/O limitations.\n",
+			name, max_dusize);
+	if (!have_valid_dusizes) {
+		pr_warn("%s: No valid crypto data unit sizes. Disabling inline encryption.\n",
+			name);
+		return false;
+	}
+	for (i = 0; i < ARRAY_SIZE(ksm->crypto_modes_supported); i++)
+		ksm->crypto_modes_supported[i] &= valid_dusize_mask;
+
 	q->ksm = ksm;
 	return true;
 }
