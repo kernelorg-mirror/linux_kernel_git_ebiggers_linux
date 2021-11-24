@@ -25,10 +25,7 @@ static const struct cqhci_crypto_alg_entry {
 static inline struct cqhci_host *
 cqhci_host_from_crypto_profile(struct blk_crypto_profile *profile)
 {
-	struct mmc_host *mmc =
-		container_of(profile, struct mmc_host, crypto_profile);
-
-	return mmc->cqe_private;
+	return profile->private;
 }
 
 static int cqhci_crypto_program_key(struct cqhci_host *cq_host,
@@ -169,8 +166,8 @@ int cqhci_crypto_init(struct cqhci_host *cq_host)
 {
 	struct mmc_host *mmc = cq_host->mmc;
 	struct device *dev = mmc_dev(mmc);
-	struct blk_crypto_profile *profile = &mmc->crypto_profile;
 	unsigned int num_keyslots;
+	struct blk_crypto_profile *profile;
 	unsigned int cap_idx;
 	enum blk_crypto_mode_num blk_mode_num;
 	unsigned int slot;
@@ -200,10 +197,13 @@ int cqhci_crypto_init(struct cqhci_host *cq_host)
 	 */
 	num_keyslots = cq_host->crypto_capabilities.config_count + 1;
 
-	err = devm_blk_crypto_profile_init(dev, profile, num_keyslots);
-	if (err)
+	profile = devm_blk_crypto_profile_alloc(dev, num_keyslots);
+	if (IS_ERR(profile)) {
+		err = PTR_ERR(profile);
 		goto out;
+	}
 
+	profile->private = cq_host;
 	profile->ll_ops = cqhci_crypto_ops;
 	profile->dev = dev;
 
@@ -235,6 +235,11 @@ int cqhci_crypto_init(struct cqhci_host *cq_host)
 	/* CQHCI crypto requires the use of 128-bit task descriptors. */
 	cq_host->caps |= CQHCI_TASK_DESC_SZ_128;
 
+	err = kobject_add(&profile->kobj, &dev->kobj, "crypto");
+	if (err)
+		goto out;
+
+	mmc->crypto_profile = profile;
 	return 0;
 
 out:

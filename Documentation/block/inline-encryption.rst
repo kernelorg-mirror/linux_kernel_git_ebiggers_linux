@@ -229,9 +229,9 @@ API presented to device drivers
 ===============================
 
 A device driver that wants to support inline encryption must set up a
-blk_crypto_profile in the request_queue of its device.  To do this, it first
-must call ``blk_crypto_profile_init()`` (or its resource-managed variant
-``devm_blk_crypto_profile_init()``), providing the number of keyslots.
+blk_crypto_profile.  To do this, it must first call
+``devm_blk_crypto_profile_alloc()``, providing the number of keyslots.  (The
+non-resource managed variant ``blk_crypto_profile_alloc()`` may also be used.)
 
 Next, it must advertise its crypto capabilities by setting fields in the
 blk_crypto_profile, e.g. ``modes_supported`` and ``max_dun_bytes_supported``.
@@ -241,6 +241,12 @@ blk_crypto_profile to tell upper layers how to control the inline encryption
 hardware, e.g. how to program and evict keyslots.  Most drivers will need to
 implement ``keyslot_program`` and ``keyslot_evict``.  For details, see the
 comments for ``struct blk_crypto_ll_ops``.
+
+Next, it must add the blk_crypto_profile to sysfs underneath the device to which
+it belongs, using ``kobject_add()``.
+
+Finally, for each of its request_queue(s), the driver must call
+``blk_crypto_register()`` to register the crypto_profile with the request_queue.
 
 Once the driver registers a blk_crypto_profile with a request_queue, I/O
 requests the driver receives via that queue may have an encryption context.  All
@@ -259,9 +265,63 @@ If there are situations where the inline encryption hardware loses the contents
 of its keyslots, e.g. device resets, the driver must handle reprogramming the
 keyslots.  To do this, the driver may call ``blk_crypto_reprogram_all_keys()``.
 
-Finally, if the driver used ``blk_crypto_profile_init()`` instead of
-``devm_blk_crypto_profile_init()``, then it is responsible for calling
-``blk_crypto_profile_destroy()`` when the crypto profile is no longer needed.
+Finally, if the driver used ``blk_crypto_profile_alloc()`` instead of
+``devm_blk_crypto_profile_alloc()``, then it is responsible for calling
+``blk_crypto_profile_put()`` when the crypto profile is no longer needed.
+
+.. _inline_encryption_sysfs:
+
+sysfs support
+=============
+
+Since Linux v5.17, inline encryption capabilities are exposed to userspace via
+sysfs.  This allows userspace to decide whether to use inline encryption or not,
+and if so with what settings, depending on the hardware's capabilities.
+
+The inline encryption capabilities are represented as a subdirectory "crypto" of
+the directory for the device to which the inline encryption hardware belongs.
+This could be a UFS or eMMC host controller, for example.
+
+The "queue" directory of disks (see Documentation/block/queue-sysfs.rst) that
+support inline encryption will also contain a symlink "crypto", i.e.
+/sys/class/block/$disk/queue/crypto, which points to the appropriate place.
+This allows the crypto capabilities to be looked up by disk or block device.
+
+Note that multiple queues will link to the same crypto directory if the inline
+encryption hardware is shared between disks.  In this case, the crypto
+capabilities as well as the keyslots will be shared.
+
+Note: the sysfs files don't consider blk-crypto-fallback; they report the actual
+device capabilities only.
+
+The following files and subdirectories will be present in "crypto":
+
+max_dun_bits
+------------
+
+The maximum length, in bits, of data unit numbers (DUNs) accepted by the device.
+Read-only.
+
+modes
+-----
+
+This subdirectory contains one read-only file per crypto mode the device
+supports.  Each such file contains a hexadecimal number that is a bitmask of the
+supported data unit sizes, in bytes, for the crypto mode.
+
+The crypto modes that may be supported are:
+
+* AES-256-XTS
+* AES-128-CBC-ESSIV
+* Adiantum
+
+For example, if a device supports AES-256-XTS with data unit sizes of 512 and
+4096 bytes, the file "AES-256-XTS" will be present and will contain "0x1200".
+
+num_keyslots
+------------
+
+The number of keyslots the device has.  Read-only.
 
 Layered Devices
 ===============

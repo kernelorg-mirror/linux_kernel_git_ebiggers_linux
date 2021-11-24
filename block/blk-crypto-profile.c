@@ -33,13 +33,7 @@
 #include <linux/blkdev.h>
 #include <linux/blk-integrity.h>
 
-struct blk_crypto_keyslot {
-	atomic_t slot_refs;
-	struct list_head idle_slot_node;
-	struct hlist_node hash_node;
-	const struct blk_crypto_key *key;
-	struct blk_crypto_profile *profile;
-};
+#include "blk-crypto-internal.h"
 
 static inline void blk_crypto_hw_enter(struct blk_crypto_profile *profile)
 {
@@ -61,34 +55,32 @@ static inline void blk_crypto_hw_exit(struct blk_crypto_profile *profile)
 }
 
 /**
- * blk_crypto_profile_init() - Initialize a blk_crypto_profile
- * @profile: the blk_crypto_profile to initialize
+ * blk_crypto_profile_alloc() - Allocate a blk_crypto_profile
  * @num_slots: the number of keyslots
  *
- * Storage drivers must call this when starting to set up a blk_crypto_profile,
- * before filling in additional fields.
+ * Storage drivers must call this to allocate a blk_crypto_profile, before
+ * filling in additional fields.
  *
- * Return: 0 on success, or else a negative error code.
+ * Return: the new blk_crypto_profile on success; an ERR_PTR() on failure
  */
-int blk_crypto_profile_init(struct blk_crypto_profile *profile,
-			    unsigned int num_slots)
+struct blk_crypto_profile *blk_crypto_profile_alloc(unsigned int num_slots)
 {
+	struct blk_crypto_profile *profile;
 	unsigned int slot;
 	unsigned int i;
 	unsigned int slot_hashtable_size;
 
-	memset(profile, 0, sizeof(*profile));
+	profile = kvzalloc(struct_size(profile, slots, num_slots), GFP_KERNEL);
+	if (!profile)
+		return ERR_PTR(-ENOMEM);
+
 	init_rwsem(&profile->lock);
+	kobject_init(&profile->kobj, &blk_crypto_ktype);
 
 	if (num_slots == 0)
-		return 0;
+		return profile;
 
 	/* Initialize keyslot management data. */
-
-	profile->slots = kvcalloc(num_slots, sizeof(profile->slots[0]),
-				  GFP_KERNEL);
-	if (!profile->slots)
-		return -ENOMEM;
 
 	profile->num_slots = num_slots;
 
@@ -116,48 +108,50 @@ int blk_crypto_profile_init(struct blk_crypto_profile *profile,
 		kvmalloc_array(slot_hashtable_size,
 			       sizeof(profile->slot_hashtable[0]), GFP_KERNEL);
 	if (!profile->slot_hashtable)
-		goto err_destroy;
+		goto err_put;
 	for (i = 0; i < slot_hashtable_size; i++)
 		INIT_HLIST_HEAD(&profile->slot_hashtable[i]);
 
-	return 0;
+	return profile;
 
-err_destroy:
-	blk_crypto_profile_destroy(profile);
-	return -ENOMEM;
+err_put:
+	blk_crypto_profile_put(profile);
+	return ERR_PTR(-ENOMEM);
 }
-EXPORT_SYMBOL_GPL(blk_crypto_profile_init);
+EXPORT_SYMBOL_GPL(blk_crypto_profile_alloc);
 
-static void blk_crypto_profile_destroy_callback(void *profile)
+static void blk_crypto_profile_put_callback(void *profile)
 {
-	blk_crypto_profile_destroy(profile);
+	blk_crypto_profile_put(profile);
 }
 
 /**
- * devm_blk_crypto_profile_init() - Resource-managed blk_crypto_profile_init()
- * @dev: the device which owns the blk_crypto_profile
- * @profile: the blk_crypto_profile to initialize
+ * devm_blk_crypto_profile_alloc() - Resource-managed blk_crypto_profile_alloc()
+ * @dev: the device which will own the blk_crypto_profile
  * @num_slots: the number of keyslots
  *
- * Like blk_crypto_profile_init(), but causes blk_crypto_profile_destroy() to be
+ * Like blk_crypto_profile_alloc(), but causes blk_crypto_profile_put() to be
  * called automatically on driver detach.
  *
- * Return: 0 on success, or else a negative error code.
+ * Return: the new blk_crypto_profile on success; an ERR_PTR() on failure
  */
-int devm_blk_crypto_profile_init(struct device *dev,
-				 struct blk_crypto_profile *profile,
-				 unsigned int num_slots)
+struct blk_crypto_profile *
+devm_blk_crypto_profile_alloc(struct device *dev, unsigned int num_slots)
 {
-	int err = blk_crypto_profile_init(profile, num_slots);
+	struct blk_crypto_profile *profile;
+	int err;
 
+	profile = blk_crypto_profile_alloc(num_slots);
+	if (IS_ERR(profile))
+		return profile;
+
+	err = devm_add_action_or_reset(dev, blk_crypto_profile_put_callback,
+				       profile);
 	if (err)
-		return err;
-
-	return devm_add_action_or_reset(dev,
-					blk_crypto_profile_destroy_callback,
-					profile);
+		return ERR_PTR(err);
+	return profile;
 }
-EXPORT_SYMBOL_GPL(devm_blk_crypto_profile_init);
+EXPORT_SYMBOL_GPL(devm_blk_crypto_profile_alloc);
 
 static inline struct hlist_head *
 blk_crypto_hash_bucket_for_key(struct blk_crypto_profile *profile,
@@ -440,16 +434,22 @@ void blk_crypto_reprogram_all_keys(struct blk_crypto_profile *profile)
 }
 EXPORT_SYMBOL_GPL(blk_crypto_reprogram_all_keys);
 
-void blk_crypto_profile_destroy(struct blk_crypto_profile *profile)
+void blk_crypto_profile_free(struct blk_crypto_profile *profile)
 {
-	if (!profile)
-		return;
-	kvfree(profile->slot_hashtable);
-	kvfree_sensitive(profile->slots,
-			 sizeof(profile->slots[0]) * profile->num_slots);
-	memzero_explicit(profile, sizeof(*profile));
+	if (profile) {
+		size_t size = struct_size(profile, slots, profile->num_slots);
+
+		kvfree(profile->slot_hashtable);
+		kvfree_sensitive(profile, size);
+	}
 }
-EXPORT_SYMBOL_GPL(blk_crypto_profile_destroy);
+
+void blk_crypto_profile_put(struct blk_crypto_profile *profile)
+{
+	if (profile)
+		kobject_put(&profile->kobj);
+}
+EXPORT_SYMBOL_GPL(blk_crypto_profile_put);
 
 bool blk_crypto_register(struct blk_crypto_profile *profile,
 			 struct request_queue *q)

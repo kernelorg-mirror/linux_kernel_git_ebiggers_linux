@@ -9,6 +9,7 @@
 #define LINUX_MMC_CQHCI_CRYPTO_H
 
 #include <linux/mmc/host.h>
+#include <linux/blk-crypto.h>
 
 #include "cqhci.h"
 

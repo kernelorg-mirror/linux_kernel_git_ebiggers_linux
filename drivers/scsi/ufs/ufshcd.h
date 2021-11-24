@@ -32,7 +32,6 @@
 #include <linux/regulator/consumer.h>
 #include <linux/bitfield.h>
 #include <linux/devfreq.h>
-#include <linux/blk-crypto-profile.h>
 #include "unipro.h"
 
 #include <asm/irq.h>
@@ -931,7 +930,7 @@ struct ufs_hba {
 	union ufs_crypto_capabilities crypto_capabilities;
 	union ufs_crypto_cap_entry *crypto_cap_array;
 	u32 crypto_cfg_register;
-	struct blk_crypto_profile crypto_profile;
+	struct blk_crypto_profile *crypto_profile;
 #endif
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;

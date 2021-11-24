@@ -59,6 +59,14 @@ struct blk_crypto_ll_ops {
 			     unsigned int slot);
 };
 
+struct blk_crypto_keyslot {
+	atomic_t slot_refs;
+	struct list_head idle_slot_node;
+	struct hlist_node hash_node;
+	const struct blk_crypto_key *key;
+	struct blk_crypto_profile *profile;
+};
+
 /**
  * struct blk_crypto_profile - inline encryption profile for a device
  *
@@ -70,6 +78,9 @@ struct blk_crypto_ll_ops {
 struct blk_crypto_profile {
 
 	/* public: Drivers must initialize the following fields. */
+
+	/** @private: Driver private data */
+	void *private;
 
 	/**
 	 * @ll_ops: Driver-provided functions to control the inline encryption
@@ -102,6 +113,8 @@ struct blk_crypto_profile {
 
 	/* private: The following fields shouldn't be accessed by drivers. */
 
+	struct kobject kobj;
+
 	/* Number of keyslots, or 0 if not applicable */
 	unsigned int num_slots;
 
@@ -126,15 +139,13 @@ struct blk_crypto_profile {
 	unsigned int log_slot_ht_size;
 
 	/* Per-keyslot data */
-	struct blk_crypto_keyslot *slots;
+	struct blk_crypto_keyslot slots[];
 };
 
-int blk_crypto_profile_init(struct blk_crypto_profile *profile,
-			    unsigned int num_slots);
+struct blk_crypto_profile *blk_crypto_profile_alloc(unsigned int num_slots);
 
-int devm_blk_crypto_profile_init(struct device *dev,
-				 struct blk_crypto_profile *profile,
-				 unsigned int num_slots);
+struct blk_crypto_profile *
+devm_blk_crypto_profile_alloc(struct device *dev, unsigned int num_slots);
 
 unsigned int blk_crypto_keyslot_index(struct blk_crypto_keyslot *slot);
 
@@ -152,7 +163,9 @@ int __blk_crypto_evict_key(struct blk_crypto_profile *profile,
 
 void blk_crypto_reprogram_all_keys(struct blk_crypto_profile *profile);
 
-void blk_crypto_profile_destroy(struct blk_crypto_profile *profile);
+void blk_crypto_profile_free(struct blk_crypto_profile *profile);
+
+void blk_crypto_profile_put(struct blk_crypto_profile *profile);
 
 void blk_crypto_intersect_capabilities(struct blk_crypto_profile *parent,
 				       const struct blk_crypto_profile *child);

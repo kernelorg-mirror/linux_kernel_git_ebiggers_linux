@@ -7,6 +7,8 @@
 #define _UFSHCD_CRYPTO_H
 
 #ifdef CONFIG_SCSI_UFS_CRYPTO
+#include <linux/blk-crypto-profile.h>
+
 #include "ufshcd.h"
 #include "ufshci.h"
 

@@ -1186,11 +1186,6 @@ static int dm_table_register_integrity(struct dm_table *t)
 
 #ifdef CONFIG_BLK_INLINE_ENCRYPTION
 
-struct dm_crypto_profile {
-	struct blk_crypto_profile profile;
-	struct mapped_device *md;
-};
-
 struct dm_keyslot_evict_args {
 	const struct blk_crypto_key *key;
 	int err;
@@ -1216,8 +1211,7 @@ static int dm_keyslot_evict_callback(struct dm_target *ti, struct dm_dev *dev,
 static int dm_keyslot_evict(struct blk_crypto_profile *profile,
 			    const struct blk_crypto_key *key, unsigned int slot)
 {
-	struct mapped_device *md =
-		container_of(profile, struct dm_crypto_profile, profile)->md;
+	struct mapped_device *md = profile->private;
 	struct dm_keyslot_evict_args args = { key };
 	struct dm_table *t;
 	int srcu_idx;
@@ -1249,22 +1243,9 @@ device_intersect_crypto_capabilities(struct dm_target *ti, struct dm_dev *dev,
 	return 0;
 }
 
-void dm_destroy_crypto_profile(struct blk_crypto_profile *profile)
-{
-	struct dm_crypto_profile *dmcp = container_of(profile,
-						      struct dm_crypto_profile,
-						      profile);
-
-	if (!profile)
-		return;
-
-	blk_crypto_profile_destroy(profile);
-	kfree(dmcp);
-}
-
 static void dm_table_destroy_crypto_profile(struct dm_table *t)
 {
-	dm_destroy_crypto_profile(t->crypto_profile);
+	blk_crypto_profile_put(t->crypto_profile);
 	t->crypto_profile = NULL;
 }
 
@@ -1279,19 +1260,15 @@ static void dm_table_destroy_crypto_profile(struct dm_table *t)
  */
 static int dm_table_construct_crypto_profile(struct dm_table *t)
 {
-	struct dm_crypto_profile *dmcp;
 	struct blk_crypto_profile *profile;
 	struct dm_target *ti;
 	unsigned int i;
 	bool empty_profile = true;
 
-	dmcp = kmalloc(sizeof(*dmcp), GFP_KERNEL);
-	if (!dmcp)
-		return -ENOMEM;
-	dmcp->md = t->md;
-
-	profile = &dmcp->profile;
-	blk_crypto_profile_init(profile, 0);
+	profile = blk_crypto_profile_alloc(0);
+	if (IS_ERR(profile))
+		return PTR_ERR(profile);
+	profile->private = t->md;
 	profile->ll_ops.keyslot_evict = dm_keyslot_evict;
 	profile->max_dun_bytes_supported = UINT_MAX;
 	memset(profile->modes_supported, 0xFF,
@@ -1315,7 +1292,7 @@ static int dm_table_construct_crypto_profile(struct dm_table *t)
 	    !blk_crypto_has_capabilities(profile,
 					 t->md->queue->crypto_profile)) {
 		DMWARN("Inline encryption capabilities of new DM table were more restrictive than the old table's. This is not supported!");
-		dm_destroy_crypto_profile(profile);
+		blk_crypto_profile_put(profile);
 		return -EINVAL;
 	}
 
@@ -1331,7 +1308,7 @@ static int dm_table_construct_crypto_profile(struct dm_table *t)
 	}
 
 	if (empty_profile) {
-		dm_destroy_crypto_profile(profile);
+		blk_crypto_profile_put(profile);
 		profile = NULL;
 	}
 
@@ -1357,7 +1334,7 @@ static void dm_update_crypto_profile(struct request_queue *q,
 	} else {
 		blk_crypto_update_capabilities(q->crypto_profile,
 					       t->crypto_profile);
-		dm_destroy_crypto_profile(t->crypto_profile);
+		blk_crypto_profile_put(t->crypto_profile);
 	}
 	t->crypto_profile = NULL;
 }
@@ -1367,10 +1344,6 @@ static void dm_update_crypto_profile(struct request_queue *q,
 static int dm_table_construct_crypto_profile(struct dm_table *t)
 {
 	return 0;
-}
-
-void dm_destroy_crypto_profile(struct blk_crypto_profile *profile)
-{
 }
 
 static void dm_table_destroy_crypto_profile(struct dm_table *t)

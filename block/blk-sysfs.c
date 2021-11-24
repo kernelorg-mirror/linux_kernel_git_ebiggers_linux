@@ -876,6 +876,10 @@ int blk_register_queue(struct gendisk *disk)
 			goto put_dev;
 	}
 
+	ret = blk_crypto_sysfs_link(q);
+	if (ret)
+		goto unregister_elv;
+
 	blk_queue_flag_set(QUEUE_FLAG_REGISTERED, q);
 	wbt_enable_default(q);
 	blk_throtl_register_queue(q);
@@ -906,6 +910,9 @@ unlock:
 
 	return ret;
 
+unregister_elv:
+	if (q->elevator)
+		elv_unregister_queue(q);
 put_dev:
 	disk_unregister_independent_access_ranges(disk);
 	mutex_unlock(&q->sysfs_lock);
@@ -957,6 +964,7 @@ void blk_unregister_queue(struct gendisk *disk)
 	blk_trace_remove_sysfs(disk_to_dev(disk));
 
 	mutex_lock(&q->sysfs_lock);
+	blk_crypto_sysfs_unlink(q);
 	if (q->elevator)
 		elv_unregister_queue(q);
 	disk_unregister_independent_access_ranges(disk);

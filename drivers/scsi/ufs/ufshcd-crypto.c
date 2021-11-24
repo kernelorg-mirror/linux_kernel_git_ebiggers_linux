@@ -17,6 +17,12 @@ static const struct ufs_crypto_alg_entry {
 	},
 };
 
+static inline struct ufs_hba *
+ufs_hba_from_crypto_profile(struct blk_crypto_profile *profile)
+{
+	return profile->private;
+}
+
 static int ufshcd_program_key(struct ufs_hba *hba,
 			      const union ufs_crypto_cfg_entry *cfg, int slot)
 {
@@ -52,8 +58,7 @@ static int ufshcd_crypto_keyslot_program(struct blk_crypto_profile *profile,
 					 const struct blk_crypto_key *key,
 					 unsigned int slot)
 {
-	struct ufs_hba *hba =
-		container_of(profile, struct ufs_hba, crypto_profile);
+	struct ufs_hba *hba = ufs_hba_from_crypto_profile(profile);
 	const union ufs_crypto_cap_entry *ccap_array = hba->crypto_cap_array;
 	const struct ufs_crypto_alg_entry *alg =
 			&ufs_crypto_algs[key->crypto_cfg.crypto_mode];
@@ -110,8 +115,7 @@ static int ufshcd_crypto_keyslot_evict(struct blk_crypto_profile *profile,
 				       const struct blk_crypto_key *key,
 				       unsigned int slot)
 {
-	struct ufs_hba *hba =
-		container_of(profile, struct ufs_hba, crypto_profile);
+	struct ufs_hba *hba = ufs_hba_from_crypto_profile(profile);
 
 	return ufshcd_clear_keyslot(hba, slot);
 }
@@ -122,7 +126,7 @@ bool ufshcd_crypto_enable(struct ufs_hba *hba)
 		return false;
 
 	/* Reset might clear all keys, so reprogram all the keys. */
-	blk_crypto_reprogram_all_keys(&hba->crypto_profile);
+	blk_crypto_reprogram_all_keys(hba->crypto_profile);
 	return true;
 }
 
@@ -155,6 +159,7 @@ ufshcd_find_blk_crypto_mode(union ufs_crypto_cap_entry cap)
  */
 int ufshcd_hba_init_crypto_capabilities(struct ufs_hba *hba)
 {
+	struct blk_crypto_profile *profile;
 	int cap_idx;
 	int err = 0;
 	enum blk_crypto_mode_num blk_mode_num;
@@ -181,16 +186,18 @@ int ufshcd_hba_init_crypto_capabilities(struct ufs_hba *hba)
 	}
 
 	/* The actual number of configurations supported is (CFGC+1) */
-	err = devm_blk_crypto_profile_init(
-			hba->dev, &hba->crypto_profile,
-			hba->crypto_capabilities.config_count + 1);
-	if (err)
+	profile = devm_blk_crypto_profile_alloc(
+			hba->dev, hba->crypto_capabilities.config_count + 1);
+	if (IS_ERR(profile)) {
+		err = PTR_ERR(profile);
 		goto out;
+	}
 
-	hba->crypto_profile.ll_ops = ufshcd_crypto_ops;
+	profile->private = hba;
+	profile->ll_ops = ufshcd_crypto_ops;
 	/* UFS only supports 8 bytes for any DUN */
-	hba->crypto_profile.max_dun_bytes_supported = 8;
-	hba->crypto_profile.dev = hba->dev;
+	profile->max_dun_bytes_supported = 8;
+	profile->dev = hba->dev;
 
 	/*
 	 * Cache all the UFS crypto capabilities and advertise the supported
@@ -205,10 +212,15 @@ int ufshcd_hba_init_crypto_capabilities(struct ufs_hba *hba)
 		blk_mode_num = ufshcd_find_blk_crypto_mode(
 						hba->crypto_cap_array[cap_idx]);
 		if (blk_mode_num != BLK_ENCRYPTION_MODE_INVALID)
-			hba->crypto_profile.modes_supported[blk_mode_num] |=
+			profile->modes_supported[blk_mode_num] |=
 				hba->crypto_cap_array[cap_idx].sdus_mask * 512;
 	}
 
+	err = kobject_add(&profile->kobj, &hba->dev->kobj, "crypto");
+	if (err)
+		goto out;
+
+	hba->crypto_profile = profile;
 	return 0;
 
 out:
@@ -236,5 +248,5 @@ void ufshcd_init_crypto(struct ufs_hba *hba)
 void ufshcd_crypto_register(struct ufs_hba *hba, struct request_queue *q)
 {
 	if (hba->caps & UFSHCD_CAP_CRYPTO)
-		blk_crypto_register(&hba->crypto_profile, q);
+		blk_crypto_register(hba->crypto_profile, q);
 }

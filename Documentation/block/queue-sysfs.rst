@@ -24,6 +24,13 @@ or host-managed, chunk_sectors indicates the size in 512B sectors of the zones
 of the device, with the eventual exception of the last zone of the device which
 may be smaller.
 
+crypto
+------
+This symlink is present if the device supports inline encryption.  It points to
+a directory which contains the device's inline encryption capabilities.  For
+more information, refer to
+:ref:`Documentation/block/inline-encryption.rst <inline_encryption_sysfs>`.
+
 dax (RO)
 --------
 This file indicates whether the device supports Direct Access (DAX),

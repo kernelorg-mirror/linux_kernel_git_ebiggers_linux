@@ -1665,7 +1665,7 @@ static void dm_wq_work(struct work_struct *work);
 #ifdef CONFIG_BLK_INLINE_ENCRYPTION
 static void dm_queue_destroy_crypto_profile(struct request_queue *q)
 {
-	dm_destroy_crypto_profile(q->crypto_profile);
+	blk_crypto_profile_put(q->crypto_profile);
 }
 
 #else /* CONFIG_BLK_INLINE_ENCRYPTION */

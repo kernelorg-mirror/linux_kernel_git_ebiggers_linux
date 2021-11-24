@@ -15,7 +15,6 @@
 #include <linux/mmc/card.h>
 #include <linux/mmc/pm.h>
 #include <linux/dma-direction.h>
-#include <linux/blk-crypto-profile.h>
 
 struct mmc_ios {
 	unsigned int	clock;			/* clock rate */
@@ -495,7 +494,7 @@ struct mmc_host {
 
 	/* Inline encryption support */
 #ifdef CONFIG_MMC_CRYPTO
-	struct blk_crypto_profile crypto_profile;
+	struct blk_crypto_profile *crypto_profile;
 #endif
 
 	/* Host Software Queue support */

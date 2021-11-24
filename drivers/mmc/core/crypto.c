@@ -6,6 +6,7 @@
  */
 
 #include <linux/blk-crypto.h>
+#include <linux/blk-crypto-profile.h>
 #include <linux/mmc/host.h>
 
 #include "core.h"
@@ -16,13 +17,13 @@ void mmc_crypto_set_initial_state(struct mmc_host *host)
 {
 	/* Reset might clear all keys, so reprogram all the keys. */
 	if (host->caps2 & MMC_CAP2_CRYPTO)
-		blk_crypto_reprogram_all_keys(&host->crypto_profile);
+		blk_crypto_reprogram_all_keys(host->crypto_profile);
 }
 
 void mmc_crypto_setup_queue(struct request_queue *q, struct mmc_host *host)
 {
 	if (host->caps2 & MMC_CAP2_CRYPTO)
-		blk_crypto_register(&host->crypto_profile, q);
+		blk_crypto_register(host->crypto_profile, q);
 }
 EXPORT_SYMBOL_GPL(mmc_crypto_setup_queue);
 

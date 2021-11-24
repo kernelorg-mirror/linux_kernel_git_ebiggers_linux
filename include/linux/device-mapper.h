@@ -575,11 +575,6 @@ void dm_table_run_md_queue_async(struct dm_table *t);
 struct dm_table *dm_swap_table(struct mapped_device *md,
 			       struct dm_table *t);
 
-/*
- * Table blk_crypto_profile functions
- */
-void dm_destroy_crypto_profile(struct blk_crypto_profile *profile);
-
 /*-----------------------------------------------------------------
  * Macros.
  *---------------------------------------------------------------*/

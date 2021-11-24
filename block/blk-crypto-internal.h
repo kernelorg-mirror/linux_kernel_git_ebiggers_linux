@@ -11,6 +11,7 @@
 
 /* Represents a crypto mode supported by blk-crypto  */
 struct blk_crypto_mode {
+	const char *name; /* name (shown in sysfs) */
 	const char *cipher_str; /* crypto API name (for fallback case) */
 	unsigned int keysize; /* key size in bytes */
 	unsigned int ivsize; /* iv size in bytes */
@@ -19,6 +20,12 @@ struct blk_crypto_mode {
 extern const struct blk_crypto_mode blk_crypto_modes[];
 
 #ifdef CONFIG_BLK_INLINE_ENCRYPTION
+
+extern struct kobj_type blk_crypto_ktype;
+
+int blk_crypto_sysfs_link(struct request_queue *q);
+
+void blk_crypto_sysfs_unlink(struct request_queue *q);
 
 void bio_crypt_dun_increment(u64 dun[BLK_CRYPTO_DUN_ARRAY_SIZE],
 			     unsigned int inc);
@@ -61,6 +68,13 @@ static inline bool blk_crypto_rq_is_encrypted(struct request *rq)
 }
 
 #else /* CONFIG_BLK_INLINE_ENCRYPTION */
+
+static inline int blk_crypto_sysfs_link(struct request_queue *q)
+{
+	return 0;
+}
+
+static inline void blk_crypto_sysfs_unlink(struct request_queue *q) { }
 
 static inline bool bio_crypt_rq_ctx_compatible(struct request *rq,
 					       struct bio *bio)

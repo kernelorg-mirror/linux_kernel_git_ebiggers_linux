@@ -78,7 +78,7 @@ static struct blk_crypto_fallback_keyslot {
 	struct crypto_skcipher *tfms[BLK_ENCRYPTION_MODE_MAX];
 } *blk_crypto_keyslots;
 
-static struct blk_crypto_profile blk_crypto_fallback_profile;
+static struct blk_crypto_profile *blk_crypto_fallback_profile;
 static struct workqueue_struct *blk_crypto_wq;
 static mempool_t *blk_crypto_bounce_page_pool;
 static struct bio_set crypto_bio_split;
@@ -292,7 +292,7 @@ static bool blk_crypto_fallback_encrypt_bio(struct bio **bio_ptr)
 	 * Get a blk-crypto-fallback keyslot that contains a crypto_skcipher for
 	 * this bio's algorithm and key.
 	 */
-	blk_st = blk_crypto_get_keyslot(&blk_crypto_fallback_profile,
+	blk_st = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
 					bc->bc_key, &slot);
 	if (blk_st != BLK_STS_OK) {
 		src_bio->bi_status = blk_st;
@@ -395,7 +395,7 @@ static void blk_crypto_fallback_decrypt_bio(struct work_struct *work)
 	 * Get a blk-crypto-fallback keyslot that contains a crypto_skcipher for
 	 * this bio's algorithm and key.
 	 */
-	blk_st = blk_crypto_get_keyslot(&blk_crypto_fallback_profile,
+	blk_st = blk_crypto_get_keyslot(blk_crypto_fallback_profile,
 					bc->bc_key, &slot);
 	if (blk_st != BLK_STS_OK) {
 		bio->bi_status = blk_st;
@@ -499,7 +499,7 @@ bool blk_crypto_fallback_bio_prep(struct bio **bio_ptr)
 		return false;
 	}
 
-	if (!__blk_crypto_cfg_supported(&blk_crypto_fallback_profile,
+	if (!__blk_crypto_cfg_supported(blk_crypto_fallback_profile,
 					&bc->bc_key->crypto_cfg)) {
 		bio->bi_status = BLK_STS_NOTSUPP;
 		return false;
@@ -526,7 +526,7 @@ bool blk_crypto_fallback_bio_prep(struct bio **bio_ptr)
 
 int blk_crypto_fallback_evict_key(const struct blk_crypto_key *key)
 {
-	return __blk_crypto_evict_key(&blk_crypto_fallback_profile, key);
+	return __blk_crypto_evict_key(blk_crypto_fallback_profile, key);
 }
 
 static bool blk_crypto_fallback_inited;
@@ -534,7 +534,7 @@ static int blk_crypto_fallback_init(void)
 {
 	int i;
 	int err;
-	struct blk_crypto_profile *profile = &blk_crypto_fallback_profile;
+	struct blk_crypto_profile *profile;
 
 	if (blk_crypto_fallback_inited)
 		return 0;
@@ -545,9 +545,12 @@ static int blk_crypto_fallback_init(void)
 	if (err)
 		goto out;
 
-	err = blk_crypto_profile_init(profile, blk_crypto_num_keyslots);
-	if (err)
+	profile = blk_crypto_profile_alloc(blk_crypto_num_keyslots);
+	if (IS_ERR(profile)) {
+		err = PTR_ERR(profile);
 		goto fail_free_bioset;
+	}
+	blk_crypto_fallback_profile = profile;
 	err = -ENOMEM;
 
 	profile->ll_ops = blk_crypto_fallback_ll_ops;
@@ -562,7 +565,7 @@ static int blk_crypto_fallback_init(void)
 					WQ_UNBOUND | WQ_HIGHPRI |
 					WQ_MEM_RECLAIM, num_online_cpus());
 	if (!blk_crypto_wq)
-		goto fail_destroy_profile;
+		goto fail_put_profile;
 
 	blk_crypto_keyslots = kcalloc(blk_crypto_num_keyslots,
 				      sizeof(blk_crypto_keyslots[0]),
@@ -596,8 +599,8 @@ fail_free_keyslots:
 	kfree(blk_crypto_keyslots);
 fail_free_wq:
 	destroy_workqueue(blk_crypto_wq);
-fail_destroy_profile:
-	blk_crypto_profile_destroy(profile);
+fail_put_profile:
+	blk_crypto_profile_put(profile);
 fail_free_bioset:
 	bioset_exit(&crypto_bio_split);
 out:
