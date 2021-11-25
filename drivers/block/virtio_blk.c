@@ -16,6 +16,7 @@
 #include <linux/blk-mq-virtio.h>
 #include <linux/numa.h>
 #include <uapi/linux/virtio_ring.h>
+#include <linux/blk-crypto-profile.h>
 
 #define PART_BITS 4
 #define VQ_NAME_LEN 16
@@ -748,6 +749,27 @@ static const struct blk_mq_ops virtio_mq_ops = {
 static unsigned int virtblk_queue_depth;
 module_param_named(queue_depth, virtblk_queue_depth, uint, 0444);
 
+static void virtblk_add_crypto_profile(struct request_queue *q)
+{
+#ifdef CONFIG_BLK_INLINE_ENCRYPTION
+	struct blk_crypto_profile *profile;
+
+	profile = kzalloc(sizeof(*profile), GFP_KERNEL);
+	if (!profile)
+		return;
+
+	if (blk_crypto_profile_init(profile, 32) != 0) {
+		kfree(profile);
+		return;
+	}
+	profile->modes_supported[BLK_ENCRYPTION_MODE_AES_256_XTS] =
+		4096 | 8192;
+	profile->max_dun_bytes_supported = 8;
+
+	q->crypto_profile = profile;
+#endif /* CONFIG_BLK_INLINE_ENCRYPTION */
+}
+
 static int virtblk_probe(struct virtio_device *vdev)
 {
 	struct virtio_blk *vblk;
@@ -835,6 +857,8 @@ static int virtblk_probe(struct virtio_device *vdev)
 		goto out_free_tags;
 	}
 	q = vblk->disk->queue;
+
+	virtblk_add_crypto_profile(q);
 
 	virtblk_name_format("vd", index, vblk->disk->disk_name, DISK_NAME_LEN);
 
