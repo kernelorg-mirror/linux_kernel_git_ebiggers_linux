@@ -72,6 +72,15 @@ properties:
 
   dma-coherent: true
 
+  gsa-device:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: phandle to GSA node
+    description:
+      Optional phandle to the Google Security Anchor (GSA) node.  Used to
+      support hardware-wrapped inline encryption keys on Google Tensor SoCs.
+
 required:
   - compatible
   - reg
