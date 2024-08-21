@@ -16,10 +16,13 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/mfd/syscon.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/soc/google/gsa_kdn.h>
+#include <scsi/scsi_cmnd.h>
 
 #include <ufs/ufshcd.h>
 #include "ufshcd-pltfrm.h"
@@ -27,6 +30,9 @@
 #include <ufs/unipro.h>
 
 #include "ufs-exynos.h"
+
+static bool use_kdn;
+module_param(use_kdn, bool, S_IRUGO);
 
 #define DATA_UNIT_SIZE		4096
 
@@ -102,6 +108,12 @@
 #define UFS_GS101_SHARABLE		(UFS_GS101_WR_SHARABLE | \
 					 UFS_GS101_RD_SHARABLE)
 #define UFS_SHAREABILITY_OFFSET		0x710
+
+/* KDN status registers in HSI2 */
+#define HSI2_KDN_CONTROL_MONITOR	0x400	/* offset from HSI2 base */
+#define MKE_MONITOR			BIT(0)	/* Master Key Enable */
+#define DT_MONITOR			BIT(1)	/* Descriptor Type */
+#define RDY_MONITOR			BIT(2)	/* KDN ready? */
 
 /* Multi-host registers */
 #define MHCTRL			0xC4
@@ -1251,10 +1263,13 @@ enum fmp_crypto_key_length {
  *	bits of the 'size' field, i.e. the last 32-bit word.  When these
  *	nonstandard bitfields are zero, the data segment won't be encrypted or
  *	decrypted.  Otherwise they specify the algorithm and key length with
- *	which the data segment will be encrypted or decrypted.
+ *	which the data segment will be encrypted or decrypted.  In the
+ *	keyslot-based mode, they also specify the keyslot.
  * @file_iv: The initialization vector (IV) with all bytes reversed
- * @file_enckey: The first half of the AES-XTS key with all bytes reserved
- * @file_twkey: The second half of the AES-XTS key with all bytes reserved
+ * @file_enckey: The first half of the AES-XTS key with all bytes reserved.
+ *		 Unused if the keyslot-based mode is enabled.
+ * @file_twkey: The second half of the AES-XTS key with all bytes reserved.
+ *		Unused if the keyslot-based mode is enabled.
  * @disk_iv: Unused
  * @reserved: Unused
  */
@@ -1280,10 +1295,255 @@ struct fmp_sg_entry {
 #define SMU_INIT			0
 #define CFG_DESCTYPE_3			3
 
-static void exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
+/*
+ * Block new UFS requests from being issued, and wait for any outstanding UFS
+ * requests to complete.   Modified from ufshcd_clock_scaling_prepare().
+ * Must be paired with ufshcd_put_exclusive_access().
+ */
+static void ufshcd_get_exclusive_access(struct ufs_hba *hba)
+{
+	#define DOORBELL_CLR_WARN_US		(5 * 1000 * 1000) /* 5 secs */
+	#define	DEFAULT_IO_TIMEOUT		(msecs_to_jiffies(20))
+	u32 tm_doorbell;
+	u32 tr_doorbell;
+	ktime_t start;
+	unsigned long flags;
+
+	/*if (atomic_inc_return(&hba->scsi_block_reqs_cnt) == 1)*/
+		scsi_block_requests(hba->host);
+
+	down_write(&hba->clk_scaling_lock);
+
+	ufshcd_hold(hba);
+	spin_lock_irqsave(hba->host->host_lock, flags);
+	start = ktime_get();
+	do {
+		tm_doorbell = ufshcd_readl(hba, REG_UTP_TASK_REQ_DOOR_BELL);
+		tr_doorbell = ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL);
+		if (!tm_doorbell && !tr_doorbell)
+			break;
+
+		spin_unlock_irqrestore(hba->host->host_lock, flags);
+		io_schedule_timeout(DEFAULT_IO_TIMEOUT);
+		if (ktime_to_us(ktime_sub(ktime_get(), start)) >
+					DOORBELL_CLR_WARN_US) {
+			start = ktime_get();
+			dev_err(hba->dev,
+				"%s: warning: waiting too much for doorbell to clear (tm=0x%x, tr=0x%x)\n",
+				__func__, tm_doorbell, tr_doorbell);
+		}
+		spin_lock_irqsave(hba->host->host_lock, flags);
+	} while (tm_doorbell || tr_doorbell);
+
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
+	ufshcd_release(hba);
+}
+
+static void ufshcd_put_exclusive_access(struct ufs_hba *hba)
+{
+	up_write(&hba->clk_scaling_lock);
+	/*if (atomic_dec_and_test(&hba->scsi_block_reqs_cnt))*/
+		scsi_unblock_requests(hba->host);
+}
+
+static int gs_ufs_keyslot_program(struct blk_crypto_profile *profile,
+				  const struct blk_crypto_key *key,
+				  unsigned int slot)
+{
+	struct ufs_hba *hba = container_of(profile, struct ufs_hba, crypto_profile);
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+	int err;
+
+	dev_info(hba->dev,
+		 "kdn: programming keyslot %u with %u-byte wrapped key\n",
+		 slot, key->size);
+
+	/*
+	 * This hardware doesn't allow any encrypted I/O at all while a keyslot
+	 * is being modified.
+	 */
+	ufshcd_get_exclusive_access(hba);
+
+	err = gsa_kdn_program_key(ufs->gsa_dev, slot, key->bytes, key->size);
+
+	ufshcd_put_exclusive_access(hba);
+
+	return err;
+}
+
+static int gs_ufs_keyslot_evict(struct blk_crypto_profile *profile,
+				const struct blk_crypto_key *key,
+				unsigned int slot)
+{
+	struct ufs_hba *hba = container_of(profile, struct ufs_hba, crypto_profile);
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+	int err;
+
+	dev_info(hba->dev, "kdn: evicting keyslot %u\n", slot);
+
+	/*
+	 * This hardware doesn't allow any encrypted I/O at all while a keyslot
+	 * is being modified.
+	 */
+	ufshcd_get_exclusive_access(hba);
+
+	err = gsa_kdn_program_key(ufs->gsa_dev, slot, NULL, 0);
+
+	ufshcd_put_exclusive_access(hba);
+
+	return err;
+}
+
+static int gs_ufs_derive_sw_secret(struct blk_crypto_profile *profile,
+				   const u8 *eph_key, size_t eph_key_size,
+				   u8 sw_secret[BLK_CRYPTO_SW_SECRET_SIZE])
+{
+	struct ufs_hba *hba = container_of(profile, struct ufs_hba, crypto_profile);
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+
+	dev_info(hba->dev,
+		 "kdn: deriving sw secret from %zu-byte wrapped key\n",
+		 eph_key_size);
+
+	return gsa_kdn_derive_sw_secret(ufs->gsa_dev, eph_key, eph_key_size,
+					sw_secret, BLK_CRYPTO_SW_SECRET_SIZE);
+}
+
+static int gs_ufs_import_key(struct blk_crypto_profile *profile,
+			     const u8 *raw_key, size_t raw_key_size,
+			     u8 lt_key[BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE])
+{
+	struct ufs_hba *hba = container_of(profile, struct ufs_hba, crypto_profile);
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+
+	return gsa_kdn_generate_key(ufs->gsa_dev, raw_key, raw_key_size,
+				    lt_key, BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE);
+}
+
+static int gs_ufs_generate_key(struct blk_crypto_profile *profile,
+			       u8 lt_key[BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE])
+{
+	struct ufs_hba *hba = container_of(profile, struct ufs_hba, crypto_profile);
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+
+	return gsa_kdn_generate_key(ufs->gsa_dev, NULL, 0,
+				    lt_key, BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE);
+}
+
+static int gs_ufs_prepare_key(struct blk_crypto_profile *profile,
+			      const u8 *lt_key, size_t lt_key_size,
+			      u8 eph_key[BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE])
+{
+	struct ufs_hba *hba = container_of(profile, struct ufs_hba, crypto_profile);
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+
+	return gsa_kdn_ephemeral_wrap_key(ufs->gsa_dev, lt_key, lt_key_size,
+					  eph_key,
+					  BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE);
+}
+
+static const struct blk_crypto_ll_ops gs_ufs_crypto_ops = {
+	.keyslot_program	= gs_ufs_keyslot_program,
+	.keyslot_evict		= gs_ufs_keyslot_evict,
+	.derive_sw_secret	= gs_ufs_derive_sw_secret,
+	.import_key		= gs_ufs_import_key,
+	.generate_key		= gs_ufs_generate_key,
+	.prepare_key		= gs_ufs_prepare_key,
+};
+
+static void gs_ufs_release_gsa_device(void *_ufs)
+{
+	struct exynos_ufs *ufs = _ufs;
+
+	put_device(ufs->gsa_dev);
+}
+
+/*
+ * Get the GSA device from the device tree and save a pointer to it in the UFS
+ * host struct.
+ */
+static int gs_ufs_find_gsa_device(struct ufs_hba *hba, struct exynos_ufs *ufs)
+{
+	struct device_node *np;
+	struct platform_device *gsa_pdev;
+
+	np = of_parse_phandle(hba->dev->of_node, "gsa-device", 0);
+	if (!np)
+		goto not_found;
+	gsa_pdev = of_find_device_by_node(np);
+	of_node_put(np);
+
+	if (!gsa_pdev)
+		goto not_found;
+	ufs->gsa_dev = &gsa_pdev->dev;
+	return devm_add_action_or_reset(hba->dev, gs_ufs_release_gsa_device,
+					ufs);
+
+not_found:
+	dev_warn(hba->dev, "gsa_dev not found.  Ignoring use_kdn=1\n");
+	return 0;
+}
+
+/*
+ * Read the HSI2_KDN_CONTROL_MONITOR register to verify that the KDN is
+ * configured correctly.
+ *
+ * Note that the KE (KDF Enable) bit isn't shown by the register, as it is
+ * actually a per-keyslot thing.  So we can't verify KE=0 here.
+ */
+static void gs_ufs_crypto_check_hw(struct ufs_hba *hba, struct exynos_ufs *ufs)
+{
+	unsigned int val = 0;
+	int err;
+
+	err = regmap_read(ufs->sysreg, HSI2_KDN_CONTROL_MONITOR, &val);
+	if (err) {
+		dev_err(hba->dev,
+			"failed to read HSI2_KDN_CONTROL_MONITOR; err=%d\n",
+			err);
+		return;
+	}
+	WARN((val & (MKE_MONITOR | DT_MONITOR)) != MKE_MONITOR,
+	     "unexpected KDN status in HSI2_KDN_CONTROL_MONITOR: 0x%08x\n",
+	     val);
+}
+
+static int gs_ufs_crypto_fill_prdt(struct ufs_hba *hba, struct ufshcd_lrb *lrbp,
+				   struct fmp_sg_entry *prdt,
+				   unsigned int num_segments)
+{
+	unsigned int i;
+
+	for (i = 0; i < num_segments; i++) {
+		struct fmp_sg_entry *prd = &prdt[i];
+
+		if (le32_to_cpu(prd->base.size) + 1 != DATA_UNIT_SIZE) {
+			dev_err(hba->dev,
+				"scatterlist segment is misaligned for crypto\n");
+			return -EIO;
+		}
+
+		prd->base.size |= cpu_to_le32((1U << 31) |
+					      (lrbp->crypto_key_slot << 18));
+		prd->file_iv[0] = 0;
+		prd->file_iv[1] = cpu_to_be64(lrbp->data_unit_num + i);
+	}
+
+	/*
+	 * Unset the keyslot in the ufshcd_lrb so that the keyslot and DUN don't
+	 * get filled into the UTRD according to the UFSHCI standard.
+	 */
+	lrbp->crypto_key_slot = -1;
+	return 0;
+}
+
+static int exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
 {
 	struct blk_crypto_profile *profile = &hba->crypto_profile;
 	struct arm_smccc_res res;
+	unsigned int quirks = UFSHCD_QUIRK_CUSTOM_CRYPTO_PROFILE |
+			      UFSHCD_QUIRK_BROKEN_CRYPTO_ENABLE;
+	unsigned int num_keyslots;
 	int err;
 
 	/*
@@ -1295,7 +1555,7 @@ static void exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
 	 */
 	if (!(ufshcd_readl(hba, REG_CONTROLLER_CAPABILITIES) &
 	      MASK_CRYPTO_SUPPORT))
-		return;
+		return 0;
 
 	/*
 	 * The below sequence of SMC calls to enable FMP can be found in the
@@ -1308,7 +1568,26 @@ static void exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
 	 * enable FMP support on SoCs with EXYNOS_UFS_OPT_UFSPR_SECURE.
 	 */
 	if (!(ufs->opts & EXYNOS_UFS_OPT_UFSPR_SECURE))
-		return;
+		return 0;
+
+	if (use_kdn) {
+		err = gs_ufs_find_gsa_device(hba, ufs);
+		if (err)
+			return err;
+		if (ufs->gsa_dev) {
+			err = gsa_kdn_set_operating_mode(
+						ufs->gsa_dev,
+						KDN_SW_KDF_MODE,
+						KDN_UFS_DESCR_TYPE_PRDT);
+			if (err) {
+				dev_err(hba->dev,
+					"failed to configure KDN; err=%d\n",
+					err);
+				return -ENODEV;
+			}
+			gs_ufs_crypto_check_hw(hba, ufs);
+		}
+	}
 
 	/*
 	 * This call (which sets DESCTYPE to 0x3 in the FMPSECURITY0 register)
@@ -1321,7 +1600,7 @@ static void exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
 		dev_warn(hba->dev,
 			 "SMC_CMD_FMP_SECURITY failed on init: %ld.  Disabling FMP support.\n",
 			 res.a0);
-		return;
+		return 0;
 	}
 	ufshcd_set_sg_entry_size(hba, sizeof(struct fmp_sg_entry));
 
@@ -1334,36 +1613,47 @@ static void exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
 		dev_err(hba->dev,
 			"SMC_CMD_SMU(SMU_INIT) failed: %ld.  Disabling FMP support.\n",
 			res.a0);
-		return;
+		return 0;
 	}
 
 	/* Advertise crypto capabilities to the block layer. */
-	err = devm_blk_crypto_profile_init(hba->dev, profile, 0);
+	if (ufs->gsa_dev)
+		num_keyslots = KDN_NUM_SLOTS;
+	else
+		num_keyslots = 0;
+	err = devm_blk_crypto_profile_init(hba->dev, profile, num_keyslots);
 	if (err) {
 		/* Only ENOMEM should be possible here. */
 		dev_err(hba->dev, "Failed to initialize crypto profile: %d\n",
 			err);
-		return;
+		return err;
 	}
-	profile->max_dun_bytes_supported = AES_BLOCK_SIZE;
-	profile->key_types_supported = BLK_CRYPTO_KEY_TYPE_RAW;
-	profile->dev = hba->dev;
+	if (ufs->gsa_dev) {
+		profile->ll_ops = gs_ufs_crypto_ops;
+		profile->max_dun_bytes_supported = 8;
+		profile->key_types_supported = BLK_CRYPTO_KEY_TYPE_HW_WRAPPED;
+	} else {
+		/* No ll_ops are required in this case. */
+		profile->max_dun_bytes_supported = AES_BLOCK_SIZE;
+		profile->key_types_supported = BLK_CRYPTO_KEY_TYPE_RAW;
+		quirks |= UFSHCD_QUIRK_KEYS_IN_PRDT;
+	}
 	profile->modes_supported[BLK_ENCRYPTION_MODE_AES_256_XTS] =
 		DATA_UNIT_SIZE;
+	profile->dev = hba->dev;
 
 	/* Advertise crypto support to ufshcd-core. */
 	hba->caps |= UFSHCD_CAP_CRYPTO;
 
 	/* Advertise crypto quirks to ufshcd-core. */
-	hba->quirks |= UFSHCD_QUIRK_CUSTOM_CRYPTO_PROFILE |
-		       UFSHCD_QUIRK_BROKEN_CRYPTO_ENABLE |
-		       UFSHCD_QUIRK_KEYS_IN_PRDT;
-
+	hba->quirks |= quirks;
+	return 0;
 }
 
-static void exynos_ufs_fmp_resume(struct ufs_hba *hba)
+static void exynos_ufs_fmp_resume(struct ufs_hba *hba, struct exynos_ufs *ufs)
 {
 	struct arm_smccc_res res;
+	int err;
 
 	if (!(hba->caps & UFSHCD_CAP_CRYPTO))
 		return;
@@ -1379,6 +1669,13 @@ static void exynos_ufs_fmp_resume(struct ufs_hba *hba)
 	if (res.a0)
 		dev_err(hba->dev,
 			"SMC_CMD_FMP_SMU_RESUME failed: %ld\n", res.a0);
+
+	if (ufs->gsa_dev) {
+		err = gsa_kdn_restore_keys(ufs->gsa_dev);
+		if (err)
+			dev_err(hba->dev,
+				"kdn: failed to restore keys; err=%d\n", err);
+	}
 }
 
 static inline __be64 fmp_key_word(const u8 *key, int j)
@@ -1389,23 +1686,32 @@ static inline __be64 fmp_key_word(const u8 *key, int j)
 
 /* Fill the PRDT for a request according to the given encryption context. */
 static int exynos_ufs_fmp_fill_prdt(struct ufs_hba *hba,
-				    const struct bio_crypt_ctx *crypt_ctx,
-				    void *prdt, unsigned int num_segments)
+				    struct ufshcd_lrb *lrbp,
+				    unsigned int num_segments)
 {
-	struct fmp_sg_entry *fmp_prdt = prdt;
-	const u8 *enckey = crypt_ctx->bc_key->bytes;
-	const u8 *twkey = enckey + AES_KEYSIZE_256;
-	u64 dun_lo = crypt_ctx->bc_dun[0];
-	u64 dun_hi = crypt_ctx->bc_dun[1];
+	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+	struct fmp_sg_entry *prdt = (void *)lrbp->ucd_prdt_ptr;
+	const struct bio_crypt_ctx *crypt_ctx;
+	const u8 *enckey, *twkey;
+	u64 dun_lo, dun_hi;
 	unsigned int i;
 
 	/* If FMP wasn't enabled, we shouldn't get any encrypted requests. */
 	if (WARN_ON_ONCE(!(hba->caps & UFSHCD_CAP_CRYPTO)))
 		return -EIO;
 
+	if (ufs->gsa_dev)
+		return gs_ufs_crypto_fill_prdt(hba, lrbp, prdt, num_segments);
+
+	crypt_ctx = scsi_cmd_to_rq(lrbp->cmd)->crypt_ctx;
+	enckey = crypt_ctx->bc_key->bytes;
+	twkey = enckey + AES_KEYSIZE_256;
+	dun_lo = crypt_ctx->bc_dun[0];
+	dun_hi = crypt_ctx->bc_dun[1];
+
 	/* Configure FMP on each segment of the request. */
 	for (i = 0; i < num_segments; i++) {
-		struct fmp_sg_entry *prd = &fmp_prdt[i];
+		struct fmp_sg_entry *prd = &prdt[i];
 		int j;
 
 		/* Each segment must be exactly one data unit. */
@@ -1439,11 +1745,12 @@ static int exynos_ufs_fmp_fill_prdt(struct ufs_hba *hba,
 
 #else /* CONFIG_SCSI_UFS_CRYPTO */
 
-static void exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
+static int exynos_ufs_fmp_init(struct ufs_hba *hba, struct exynos_ufs *ufs)
 {
+	return 0;
 }
 
-static void exynos_ufs_fmp_resume(struct ufs_hba *hba)
+static void exynos_ufs_fmp_resume(struct ufs_hba *hba, struct exynos_ufs *ufs)
 {
 }
 
@@ -1498,7 +1805,11 @@ static int exynos_ufs_init(struct ufs_hba *hba)
 
 	exynos_ufs_priv_init(hba, ufs);
 
-	exynos_ufs_fmp_init(hba, ufs);
+	ret = exynos_ufs_fmp_init(hba, ufs);
+	if (ret) {
+		dev_err(dev, "failed to initialize FMP");
+		goto out;
+	}
 
 	if (ufs->drv_data->drv_init) {
 		ret = ufs->drv_data->drv_init(ufs);
@@ -1732,7 +2043,7 @@ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 		phy_power_on(ufs->phy);
 
 	exynos_ufs_config_smu(ufs);
-	exynos_ufs_fmp_resume(hba);
+	exynos_ufs_fmp_resume(hba, ufs);
 	return 0;
 }
 

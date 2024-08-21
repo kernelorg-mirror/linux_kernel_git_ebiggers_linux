@@ -44,8 +44,7 @@ static inline int ufshcd_crypto_fill_prdt(struct ufs_hba *hba,
 	const struct bio_crypt_ctx *crypt_ctx = scsi_cmd_to_rq(cmd)->crypt_ctx;
 
 	if (crypt_ctx && hba->vops && hba->vops->fill_crypto_prdt)
-		return hba->vops->fill_crypto_prdt(hba, crypt_ctx,
-						   lrbp->ucd_prdt_ptr,
+		return hba->vops->fill_crypto_prdt(hba, lrbp,
 						   scsi_sg_count(cmd));
 	return 0;
 }

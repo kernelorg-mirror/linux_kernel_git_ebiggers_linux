@@ -119,6 +119,7 @@ config SCSI_UFS_TI_J721E
 config SCSI_UFS_EXYNOS
 	tristate "Exynos specific hooks to UFS controller platform driver"
 	depends on SCSI_UFSHCD_PLATFORM && (ARCH_EXYNOS || COMPILE_TEST)
+	select GOOGLE_SECURITY_ANCHOR if SCSI_UFS_CRYPTO
 	help
 	  This selects the Samsung Exynos SoC specific additions to UFSHCD
 	  platform driver.  UFS host on Samsung Exynos SoC includes HCI and
