@@ -1374,6 +1374,7 @@
 			phys = <&ufs_0_phy>;
 			phy-names = "ufs-phy";
 			samsung,sysreg = <&sysreg_hsi2 0x710>;
+			gsa-device = <&gsa>;
 			status = "disabled";
 		};
 
@@ -1490,6 +1491,12 @@
 			clocks = <0>;
 			clock-names = "pclk";
 			status = "disabled";
+		};
+
+		gsa: gsa@17c90000 {
+			compatible = "google,gs101-gsa";
+			reg = <0x17c90000 0x1000>;
+			interrupts = <GIC_SPI 447 IRQ_TYPE_LEVEL_HIGH 0>;
 		};
 
 		cmu_top: clock-controller@1e080000 {
