@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+if ARCH_EXYNOS || COMPILE_TEST
+
+menu "Google SoC drivers"
+
+config GOOGLE_SECURITY_ANCHOR
+	tristate "Driver for Google Security Anchor (GSA)"
+	help
+	  This is the driver for the Google Security Anchor (GSA), also known as
+	  the Google Tensor security core.  GSA consists of a dedicated CPU,
+	  ROM, one-time programmable (OTP) memory, crypto engine, internal SRAM,
+	  and protected DRAM.  Its use cases include protecting user data keys
+	  at runtime, hardening secure boot, and interfacing with the Titan M2.
+
+	  Enabling this driver allows the Universal Flash Storage (UFS) driver
+	  to use GSA to support hardware-wrapped inline encryption keys on
+	  Google Tensor SoCs.  Other functionality of GSA is not yet supported
+	  by this driver.
+
+endmenu
+
+endif
