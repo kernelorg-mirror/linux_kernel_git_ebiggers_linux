@@ -55,7 +55,6 @@
  */
 
 #include <linux/linkage.h>
-#include <linux/cfi_types.h>
 
 .section .rodata
 .p2align 4
@@ -773,7 +772,7 @@
 //
 // Encrypt |iv| using the AES key |tweak_key| to get the first tweak.  Assumes
 // that the CPU supports AES-NI and AVX, but not necessarily VAES or AVX10.
-SYM_TYPED_FUNC_START(aes_xts_encrypt_iv)
+SYM_FUNC_START(aes_xts_encrypt_iv)
 	.set	TWEAK_KEY,	%rdi
 	.set	IV,		%rsi
 	.set	KEYLEN,		%eax
@@ -803,9 +802,9 @@ SYM_FUNC_END(aes_xts_encrypt_iv)
 // Below are the actual AES-XTS encryption and decryption functions,
 // instantiated from the above macro.  They all have the following prototype:
 //
-// void (*xts_crypt_func)(const struct crypto_aes_ctx *key,
-//			  const u8 *src, u8 *dst, int len,
-//			  u8 tweak[AES_BLOCK_SIZE]);
+// void aes_xts_{en,de}crypt_##suffix(const struct crypto_aes_ctx *key,
+//				      const u8 *src, u8 *dst, int len,
+//				      u8 tweak[AES_BLOCK_SIZE]);
 //
 // |key| is the data key.  |tweak| contains the next tweak; the encryption of
 // the original IV with the tweak key was already done.  This function supports
@@ -815,38 +814,38 @@ SYM_FUNC_END(aes_xts_encrypt_iv)
 
 .set	VL, 16
 .set	USE_AVX10, 0
-SYM_TYPED_FUNC_START(aes_xts_encrypt_aesni_avx)
+SYM_FUNC_START(aes_xts_encrypt_aesni_avx)
 	_aes_xts_crypt	1
 SYM_FUNC_END(aes_xts_encrypt_aesni_avx)
-SYM_TYPED_FUNC_START(aes_xts_decrypt_aesni_avx)
+SYM_FUNC_START(aes_xts_decrypt_aesni_avx)
 	_aes_xts_crypt	0
 SYM_FUNC_END(aes_xts_decrypt_aesni_avx)
 
 #if defined(CONFIG_AS_VAES) && defined(CONFIG_AS_VPCLMULQDQ)
 .set	VL, 32
 .set	USE_AVX10, 0
-SYM_TYPED_FUNC_START(aes_xts_encrypt_vaes_avx2)
+SYM_FUNC_START(aes_xts_encrypt_vaes_avx2)
 	_aes_xts_crypt	1
 SYM_FUNC_END(aes_xts_encrypt_vaes_avx2)
-SYM_TYPED_FUNC_START(aes_xts_decrypt_vaes_avx2)
+SYM_FUNC_START(aes_xts_decrypt_vaes_avx2)
 	_aes_xts_crypt	0
 SYM_FUNC_END(aes_xts_decrypt_vaes_avx2)
 
 .set	VL, 32
 .set	USE_AVX10, 1
-SYM_TYPED_FUNC_START(aes_xts_encrypt_vaes_avx10_256)
+SYM_FUNC_START(aes_xts_encrypt_vaes_avx10_256)
 	_aes_xts_crypt	1
 SYM_FUNC_END(aes_xts_encrypt_vaes_avx10_256)
-SYM_TYPED_FUNC_START(aes_xts_decrypt_vaes_avx10_256)
+SYM_FUNC_START(aes_xts_decrypt_vaes_avx10_256)
 	_aes_xts_crypt	0
 SYM_FUNC_END(aes_xts_decrypt_vaes_avx10_256)
 
 .set	VL, 64
 .set	USE_AVX10, 1
-SYM_TYPED_FUNC_START(aes_xts_encrypt_vaes_avx10_512)
+SYM_FUNC_START(aes_xts_encrypt_vaes_avx10_512)
 	_aes_xts_crypt	1
 SYM_FUNC_END(aes_xts_encrypt_vaes_avx10_512)
-SYM_TYPED_FUNC_START(aes_xts_decrypt_vaes_avx10_512)
+SYM_FUNC_START(aes_xts_decrypt_vaes_avx10_512)
 	_aes_xts_crypt	0
 SYM_FUNC_END(aes_xts_decrypt_vaes_avx10_512)
 #endif /* CONFIG_AS_VAES && CONFIG_AS_VPCLMULQDQ */

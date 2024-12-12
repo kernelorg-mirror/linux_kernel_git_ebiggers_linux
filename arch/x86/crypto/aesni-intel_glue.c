@@ -502,15 +502,108 @@ static int xts_setkey_aesni(struct crypto_skcipher *tfm, const u8 *key,
 	return aes_set_key_common(&ctx->tweak_ctx, key + keylen, keylen);
 }
 
-typedef void (*xts_encrypt_iv_func)(const struct crypto_aes_ctx *tweak_key,
-				    u8 iv[AES_BLOCK_SIZE]);
-typedef void (*xts_crypt_func)(const struct crypto_aes_ctx *key,
+/*
+ * These flags are passed to the AES-XTS and AES-GCM helper functions to specify
+ * whether it's encryption or decryption, which assembly functions should be
+ * called, and the specific version of AES-GCM (RFC4106 or not) when applicable,
+ * Assembly functions are selected using flags instead of function pointers to
+ * avoid indirect calls (which are very expensive on x86) regardless of
+ * inlining.
+ */
+
+#define FLAG_RFC4106	BIT(0)
+#define FLAG_ENC	BIT(1)
+#define FLAG_AVX	BIT(2)
+#if defined(CONFIG_AS_VAES) && defined(CONFIG_AS_VPCLMULQDQ)
+#  define FLAG_VAES_AVX2	BIT(3)
+#  define FLAG_AVX10_256	BIT(4)
+#  define FLAG_AVX10_512	BIT(5)
+#else
+   /*
+    * This should cause all calls to the VAES assembly functions to be optimized
+    * out, avoiding the need to ifdef each call individually.
+    */
+#  define FLAG_VAES_AVX2	0
+#  define FLAG_AVX10_256	0
+#  define FLAG_AVX10_512	0
+#endif
+
+asmlinkage void
+aes_xts_encrypt_aesni_avx(const struct crypto_aes_ctx *key,
+			  const u8 *src, u8 *dst, int len,
+			  u8 tweak[AES_BLOCK_SIZE]);
+asmlinkage void
+aes_xts_encrypt_vaes_avx2(const struct crypto_aes_ctx *key,
+			  const u8 *src, u8 *dst, int len,
+			  u8 tweak[AES_BLOCK_SIZE]);
+asmlinkage void
+aes_xts_encrypt_vaes_avx10_256(const struct crypto_aes_ctx *key,
+			       const u8 *src, u8 *dst, int len,
+			       u8 tweak[AES_BLOCK_SIZE]);
+asmlinkage void
+aes_xts_encrypt_vaes_avx10_512(const struct crypto_aes_ctx *key,
 			       const u8 *src, u8 *dst, int len,
 			       u8 tweak[AES_BLOCK_SIZE]);
 
+asmlinkage void
+aes_xts_decrypt_aesni_avx(const struct crypto_aes_ctx *key,
+			  const u8 *src, u8 *dst, int len,
+			  u8 tweak[AES_BLOCK_SIZE]);
+asmlinkage void
+aes_xts_decrypt_vaes_avx2(const struct crypto_aes_ctx *key,
+			  const u8 *src, u8 *dst, int len,
+			  u8 tweak[AES_BLOCK_SIZE]);
+asmlinkage void
+aes_xts_decrypt_vaes_avx10_256(const struct crypto_aes_ctx *key,
+			       const u8 *src, u8 *dst, int len,
+			       u8 tweak[AES_BLOCK_SIZE]);
+asmlinkage void
+aes_xts_decrypt_vaes_avx10_512(const struct crypto_aes_ctx *key,
+			       const u8 *src, u8 *dst, int len,
+			       u8 tweak[AES_BLOCK_SIZE]);
+
+asmlinkage void
+aes_xts_encrypt_iv(const struct crypto_aes_ctx *tweak_key,
+		   u8 iv[AES_BLOCK_SIZE]);
+
+/* __always_inline to optimize out the branches based on @flags */
+static __always_inline void
+aes_xts_update(const struct crypto_aes_ctx *key,
+	       const u8 *src, u8 *dst, int len,
+	       u8 tweak[AES_BLOCK_SIZE], int flags)
+{
+	if (flags & FLAG_ENC) {
+		if (flags & FLAG_AVX10_512)
+			aes_xts_encrypt_vaes_avx10_512(key, src, dst, len,
+						       tweak);
+		else if (flags & FLAG_AVX10_256)
+			aes_xts_encrypt_vaes_avx10_256(key, src, dst, len,
+						       tweak);
+		else if (flags & FLAG_VAES_AVX2)
+			aes_xts_encrypt_vaes_avx2(key, src, dst, len, tweak);
+		else if (flags & FLAG_AVX)
+			aes_xts_encrypt_aesni_avx(key, src, dst, len, tweak);
+		else
+			aesni_xts_enc(key, dst, src, len, tweak);
+	} else {
+		if (flags & FLAG_AVX10_512)
+			aes_xts_decrypt_vaes_avx10_512(key, src, dst, len,
+						       tweak);
+		else if (flags & FLAG_AVX10_256)
+			aes_xts_decrypt_vaes_avx10_256(key, src, dst, len,
+						       tweak);
+		else if (flags & FLAG_VAES_AVX2)
+			aes_xts_decrypt_vaes_avx2(key, src, dst, len, tweak);
+		else if (flags & FLAG_AVX)
+			aes_xts_decrypt_aesni_avx(key, src, dst, len, tweak);
+		else
+			aesni_xts_dec(key, dst, src, len, tweak);
+	}
+}
+
 /* This handles cases where the source and/or destination span pages. */
 static noinline int
-xts_crypt_slowpath(struct skcipher_request *req, xts_crypt_func crypt_func)
+xts_crypt_slowpath(struct skcipher_request *req, int flags)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
 	const struct aesni_xts_ctx *ctx = aes_xts_ctx(tfm);
@@ -542,9 +635,10 @@ xts_crypt_slowpath(struct skcipher_request *req, xts_crypt_func crypt_func)
 
 	while (walk.nbytes) {
 		kernel_fpu_begin();
-		(*crypt_func)(&ctx->crypt_ctx,
-			      walk.src.virt.addr, walk.dst.virt.addr,
-			      walk.nbytes & ~(AES_BLOCK_SIZE - 1), req->iv);
+		aes_xts_update(&ctx->crypt_ctx,
+			       walk.src.virt.addr, walk.dst.virt.addr,
+			       walk.nbytes & ~(AES_BLOCK_SIZE - 1),
+			       req->iv, flags);
 		kernel_fpu_end();
 		err = skcipher_walk_done(&walk,
 					 walk.nbytes & (AES_BLOCK_SIZE - 1));
@@ -567,17 +661,16 @@ xts_crypt_slowpath(struct skcipher_request *req, xts_crypt_func crypt_func)
 		return err;
 
 	kernel_fpu_begin();
-	(*crypt_func)(&ctx->crypt_ctx, walk.src.virt.addr, walk.dst.virt.addr,
-		      walk.nbytes, req->iv);
+	aes_xts_update(&ctx->crypt_ctx, walk.src.virt.addr, walk.dst.virt.addr,
+		       walk.nbytes, req->iv, flags);
 	kernel_fpu_end();
 
 	return skcipher_walk_done(&walk, 0);
 }
 
-/* __always_inline to avoid indirect call in fastpath */
+/* __always_inline to optimize out the branches based on @flags */
 static __always_inline int
-xts_crypt(struct skcipher_request *req, xts_encrypt_iv_func encrypt_iv,
-	  xts_crypt_func crypt_func)
+xts_crypt(struct skcipher_request *req, int flags)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
 	const struct aesni_xts_ctx *ctx = aes_xts_ctx(tfm);
@@ -589,7 +682,11 @@ xts_crypt(struct skcipher_request *req, xts_encrypt_iv_func encrypt_iv,
 		return -EINVAL;
 
 	kernel_fpu_begin();
-	(*encrypt_iv)(&ctx->tweak_ctx, req->iv);
+	if (flags & (FLAG_AVX | FLAG_VAES_AVX2 |
+		     FLAG_AVX10_256 | FLAG_AVX10_512))
+		aes_xts_encrypt_iv(&ctx->tweak_ctx, req->iv);
+	else
+		aesni_enc(&ctx->tweak_ctx, req->iv, req->iv);
 
 	/*
 	 * In practice, virtually all XTS plaintexts and ciphertexts are either
@@ -606,15 +703,15 @@ xts_crypt(struct skcipher_request *req, xts_encrypt_iv_func encrypt_iv,
 		void *src_virt = kmap_local_page(src_page) + src->offset;
 		void *dst_virt = kmap_local_page(dst_page) + dst->offset;
 
-		(*crypt_func)(&ctx->crypt_ctx, src_virt, dst_virt, cryptlen,
-			      req->iv);
+		aes_xts_update(&ctx->crypt_ctx, src_virt, dst_virt, cryptlen,
+			       req->iv, flags);
 		kunmap_local(dst_virt);
 		kunmap_local(src_virt);
 		kernel_fpu_end();
 		return 0;
 	}
 	kernel_fpu_end();
-	return xts_crypt_slowpath(req, crypt_func);
+	return xts_crypt_slowpath(req, flags);
 }
 
 static void aesni_xts_encrypt_iv(const struct crypto_aes_ctx *tweak_key,
@@ -639,12 +736,12 @@ static void aesni_xts_decrypt(const struct crypto_aes_ctx *key,
 
 static int xts_encrypt_aesni(struct skcipher_request *req)
 {
-	return xts_crypt(req, aesni_xts_encrypt_iv, aesni_xts_encrypt);
+	return xts_crypt(req, FLAG_ENC);
 }
 
 static int xts_decrypt_aesni(struct skcipher_request *req)
 {
-	return xts_crypt(req, aesni_xts_encrypt_iv, aesni_xts_decrypt);
+	return xts_crypt(req, 0);
 }
 
 static struct crypto_alg aesni_cipher_alg = {
@@ -783,26 +880,16 @@ static struct skcipher_alg aesni_xctr = {
 
 static struct simd_skcipher_alg *aesni_simd_xctr;
 
-asmlinkage void aes_xts_encrypt_iv(const struct crypto_aes_ctx *tweak_key,
-				   u8 iv[AES_BLOCK_SIZE]);
-
-#define DEFINE_XTS_ALG(suffix, driver_name, priority)			       \
-									       \
-asmlinkage void								       \
-aes_xts_encrypt_##suffix(const struct crypto_aes_ctx *key, const u8 *src,      \
-			 u8 *dst, int len, u8 tweak[AES_BLOCK_SIZE]);	       \
-asmlinkage void								       \
-aes_xts_decrypt_##suffix(const struct crypto_aes_ctx *key, const u8 *src,      \
-			 u8 *dst, int len, u8 tweak[AES_BLOCK_SIZE]);	       \
+#define DEFINE_XTS_ALG(suffix, flags, driver_name, priority)		       \
 									       \
 static int xts_encrypt_##suffix(struct skcipher_request *req)		       \
 {									       \
-	return xts_crypt(req, aes_xts_encrypt_iv, aes_xts_encrypt_##suffix);   \
+	return xts_crypt(req, (flags) | FLAG_ENC);			       \
 }									       \
 									       \
 static int xts_decrypt_##suffix(struct skcipher_request *req)		       \
 {									       \
-	return xts_crypt(req, aes_xts_encrypt_iv, aes_xts_decrypt_##suffix);   \
+	return xts_crypt(req, (flags));					       \
 }									       \
 									       \
 static struct skcipher_alg aes_xts_alg_##suffix = {			       \
@@ -826,11 +913,11 @@ static struct skcipher_alg aes_xts_alg_##suffix = {			       \
 									       \
 static struct simd_skcipher_alg *aes_xts_simdalg_##suffix
 
-DEFINE_XTS_ALG(aesni_avx, "xts-aes-aesni-avx", 500);
+DEFINE_XTS_ALG(aesni_avx, FLAG_AVX, "xts-aes-aesni-avx", 500);
 #if defined(CONFIG_AS_VAES) && defined(CONFIG_AS_VPCLMULQDQ)
-DEFINE_XTS_ALG(vaes_avx2, "xts-aes-vaes-avx2", 600);
-DEFINE_XTS_ALG(vaes_avx10_256, "xts-aes-vaes-avx10_256", 700);
-DEFINE_XTS_ALG(vaes_avx10_512, "xts-aes-vaes-avx10_512", 800);
+DEFINE_XTS_ALG(vaes_avx2, FLAG_VAES_AVX2, "xts-aes-vaes-avx2", 600);
+DEFINE_XTS_ALG(vaes_avx10_256, FLAG_AVX10_256, "xts-aes-vaes-avx10_256", 700);
+DEFINE_XTS_ALG(vaes_avx10_512, FLAG_AVX10_512, "xts-aes-vaes-avx10_512", 800);
 #endif
 
 /* The common part of the x86_64 AES-GCM key struct */
@@ -901,28 +988,6 @@ struct aes_gcm_key_avx10 {
 	container_of((key), struct aes_gcm_key_avx10, base)
 #define AES_GCM_KEY_AVX10_SIZE	\
 	(sizeof(struct aes_gcm_key_avx10) + (63 & ~(CRYPTO_MINALIGN - 1)))
-
-/*
- * These flags are passed to the AES-GCM helper functions to specify the
- * specific version of AES-GCM (RFC4106 or not), whether it's encryption or
- * decryption, and which assembly functions should be called.  Assembly
- * functions are selected using flags instead of function pointers to avoid
- * indirect calls (which are very expensive on x86) regardless of inlining.
- */
-#define FLAG_RFC4106	BIT(0)
-#define FLAG_ENC	BIT(1)
-#define FLAG_AVX	BIT(2)
-#if defined(CONFIG_AS_VAES) && defined(CONFIG_AS_VPCLMULQDQ)
-#  define FLAG_AVX10_256	BIT(3)
-#  define FLAG_AVX10_512	BIT(4)
-#else
-   /*
-    * This should cause all calls to the AVX10 assembly functions to be
-    * optimized out, avoiding the need to ifdef each call individually.
-    */
-#  define FLAG_AVX10_256	0
-#  define FLAG_AVX10_512	0
-#endif
 
 static inline struct aes_gcm_key *
 aes_gcm_key_get(struct crypto_aead *tfm, int flags)
