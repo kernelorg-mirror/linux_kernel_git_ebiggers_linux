@@ -1418,6 +1418,16 @@ config CRYPTO_USER_API_ENABLE_OBSOLETE
 	  already been phased out from internal use by the kernel, and are
 	  only useful for userspace clients that still rely on them.
 
+config CRYPTO_BENCHMARK2
+	tristate
+	depends on CRYPTO && CRYPTO_MANAGER
+	default y
+	select CRYPTO_LIB_SHA256
+	help
+	  This module exposes a file /proc/cryptobench.  Writing
+	  commands to this file triggers benchmarking and testing of
+	  crypto algorithms.
+
 endmenu
 
 config CRYPTO_HASH_INFO
