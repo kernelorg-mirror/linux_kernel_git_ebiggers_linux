@@ -16,7 +16,11 @@
 #include <linux/overflow.h>
 #include <linux/wordpart.h>
 
-static const u64 sha512_K[80] = {
+/*
+ * The SHA-512 round constants.  Used by sha512_block_generic(), and also marked
+ * as __visible because most of the SHA-512 assembly code uses it too.
+ */
+__visible const u64 sha512_K[] ____cacheline_aligned = {
 	0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
 	0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
 	0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
@@ -44,6 +48,9 @@ static const u64 sha512_K[80] = {
 	0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL,
 	0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
 	0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
+#ifdef CONFIG_ARM64
+	0, /* The arm64 assembly code expects a zero terminator. */
+#endif
 };
 
 static const struct sha512_block_state sha384_iv = {
