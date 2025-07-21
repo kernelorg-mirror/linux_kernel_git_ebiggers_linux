@@ -35,6 +35,8 @@ static inline u32 crc32_le_arch(u32 crc, const u8 *p, size_t len)
 #define CRC32C_PCLMUL_BREAKEVEN	512
 
 asmlinkage u32 crc32c_x86_3way(u32 crc, const u8 *buffer, size_t len);
+asmlinkage u32 crc32c_vpclmul_avx512(u32 crc, const u8 *data, size_t len,
+				     const void *consts);
 
 static inline u32 crc32c_arch(u32 crc, const u8 *p, size_t len)
 {
@@ -54,7 +56,7 @@ static inline u32 crc32c_arch(u32 crc, const u8 *p, size_t len)
 		 * most that x86_64 CPUs have traditionally been capable of.
 		 *
 		 * However, due to improved VPCLMULQDQ performance on newer
-		 * CPUs, use crc32_lsb_vpclmul_avx512() instead of
+		 * CPUs, use crc32c_vpclmul_avx512() instead of
 		 * crc32c_x86_3way() when the CPU supports VPCLMULQDQ and has a
 		 * "good" implementation of AVX-512.
 		 *
@@ -64,12 +66,12 @@ static inline u32 crc32c_arch(u32 crc, const u8 *p, size_t len)
 		 * on each CPU microarchitecture, making it challenging to take
 		 * advantage of this.  (Zen 5 even supports 7 parallel crc32q, a
 		 * major upgrade.)  For now, just choose between
-		 * crc32c_x86_3way() and crc32_lsb_vpclmul_avx512().  The latter
-		 * is needed anyway for crc32_le(), so we just reuse it here.
+		 * crc32c_x86_3way() and crc32c_vpclmul_avx512().  The latter
+		 * mostly reuses the code that is needed anyway for crc32_le().
 		 */
 		kernel_fpu_begin();
 		if (static_branch_likely(&have_vpclmul_avx512))
-			crc = crc32_lsb_vpclmul_avx512(crc, p, len,
+			crc = crc32c_vpclmul_avx512(crc, p, len,
 				       crc32_lsb_0x82f63b78_consts.fold_across_128_bits_consts);
 		else
 			crc = crc32c_x86_3way(crc, p, len);

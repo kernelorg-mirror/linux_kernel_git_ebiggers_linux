@@ -213,7 +213,13 @@
 // VPCLMULQDQ && AVX512BW && AVX512VL.
 //
 // Other \vl and \avx_level combinations are either not supported or not useful.
-.macro	_crc_pclmul	n, lsb_crc, vl, avx_level
+//
+// \crc32c_avx512 is 1 to specialize the function for computing the CRC-32C
+// of long messages.  Specifically, it causes the generated code to assume |len|
+// >= 256 and do the final reduction using crc32q instructions (which work only
+// for CRC-32C) instead of a generic method that works for any CRC.  Compatible
+// only with \n == 32 && \lsb_crc == 1 && \vl == 64 && \avx_level == 512.
+.macro	_crc_pclmul	n, lsb_crc, vl, avx_level, crc32c_avx512=0
 	.set	LSB_CRC,	\lsb_crc
 	.set	VL,		\vl
 	.set	AVX_LEVEL,	\avx_level
@@ -292,27 +298,30 @@
 	_vbroadcast	OFFSETOF_BSWAP_MASK(CONSTS_PTR), BSWAP_MASK
 .endif
 
+.if \crc32c_avx512 // \crc32c_avx512 implies LEN >= 256 && \avx_level == 512
+	vpxorq		(BUF), V0, V0
+.else
 	// Load the first vector of data and XOR the initial CRC into the
 	// appropriate end of the first 128-bit lane of data.  If LEN < VL, then
 	// use a short vector and jump ahead to the final reduction.  (LEN >= 16
 	// is guaranteed here but not necessarily LEN >= VL.)
-.if VL >= 32
+  .if VL >= 32
 	cmp		$VL, LEN
 	jae		.Lat_least_1vec\@
-  .if VL == 64
+    .if VL == 64
 	cmp		$32, LEN32
 	jb		.Lless_than_32bytes\@
 	_prepare_v0	32, %ymm0, %ymm1, BSWAP_MASK_YMM
 	add		$32, BUF
 	jmp		.Lreduce_256bits_to_128bits\@
 .Lless_than_32bytes\@:
-  .endif
+    .endif
 	_prepare_v0	16, %xmm0, %xmm1, BSWAP_MASK_XMM
 	add		$16, BUF
 	vmovdqa		OFFSETOF_FOLD_ACROSS_128_BITS_CONSTS(CONSTS_PTR), CONSTS_XMM
 	jmp		.Lcheck_for_partial_block\@
 .Lat_least_1vec\@:
-.endif
+  .endif
 	_prepare_v0	VL, V0, V1, BSWAP_MASK
 
 	// Handle VL <= LEN < 4*VL.
@@ -323,15 +332,16 @@
 	// If VL==16 then load fold_across_128_bits_consts first, as the final
 	// reduction depends on it and it won't be loaded anywhere else.
 	cmp		$2*VL-1, LEN32
-.if VL == 16
+  .if VL == 16
 	_cond_vex movdqa, OFFSETOF_FOLD_ACROSS_128_BITS_CONSTS(CONSTS_PTR), CONSTS_XMM
-.endif
+  .endif
 	jbe		.Lreduce_1vec_to_128bits\@
 	// Otherwise 2*VL <= LEN < 4*VL.  Load one more vector and jump ahead to
 	// the reduction from 2 vectors.
 	_load_data	VL, (BUF), BSWAP_MASK, V1
 	add		$VL, BUF
 	jmp		.Lreduce_2vecs_to_1\@
+.endif // !crc32c_avx512
 
 .Lat_least_4vecs\@:
 	// Load 3 more vectors of data.
@@ -343,8 +353,10 @@
 
 	// Main loop: while LEN >= 4*VL, fold the 4 vectors V0-V3 into the next
 	// 4 vectors of data and write the result back to V0-V3.
+.if !\crc32c_avx512 // \crc32c_avx512 implies LEN >= 256
 	cmp		$4*VL-1, LEN	// Shorter than 'cmp 4*VL' when VL=32
 	jbe		.Lreduce_4vecs_to_2\@
+.endif
 	_load_vec_folding_consts	2
 .Lfold_4vecs_loop\@:
 	_fold_vec_mem	VL, V0, 0*VL(BUF), CONSTS, BSWAP_MASK, V4, V5
@@ -448,6 +460,14 @@
 	// polynomial stored in %xmm0 (using either lsb-first or msb-first bit
 	// order according to LSB_CRC), and G is the CRC's generator polynomial.
 
+.if \crc32c_avx512
+	// Specialization for CRC-32C
+	xor		%eax, %eax
+	vmovq		%xmm0, %rdx
+	crc32q		%rdx, %rax
+	vpextrq		$1, %xmm0, %rdx
+	crc32q		%rdx, %rax
+.else
 	// First, multiply %xmm0 by x^n and reduce the result to 64+n bits:
 	//
 	//	t0 := (x^(64+n) mod G) * floor(%xmm0 / x^64) +
@@ -467,11 +487,11 @@
 	// constant that was used earlier for folding the LO64_TERMS across 128
 	// bits.  Thus it's already available in LO64_TERMS of CONSTS_XMM.
 	_pclmulqdq		CONSTS_XMM, LO64_TERMS, %xmm0, HI64_TERMS, %xmm1
-.if LSB_CRC
+  .if LSB_CRC
 	_cond_vex psrldq,	$8, %xmm0, %xmm0  // x^64 * (%xmm0 mod x^64)
-.else
+  .else
 	_cond_vex pslldq,	$8, %xmm0, %xmm0  // x^64 * (%xmm0 mod x^64)
-.endif
+  .endif
 	_cond_vex pxor,		%xmm1, %xmm0, %xmm0
 	// The HI64_TERMS of %xmm0 now contain floor(t0 / x^n).
 	// The LO64_TERMS of %xmm0 now contain (t0 mod x^n) * x^(64-n).
@@ -496,9 +516,9 @@
 	// pxor causes the low 64 terms of t1 to be wrong, but they are unused.
 	_cond_vex movdqa,	OFFSETOF_BARRETT_REDUCTION_CONSTS(CONSTS_PTR), CONSTS_XMM
 	_pclmulqdq		CONSTS_XMM, HI64_TERMS, %xmm0, HI64_TERMS, %xmm1
-.if !LSB_CRC
+  .if !LSB_CRC
 	_cond_vex pxor,		%xmm0, %xmm1, %xmm1 // += x^64 * floor(t0 / x^n)
-.endif
+  .endif
 	// The HI64_TERMS of %xmm1 now contain floor(t1 / x^64) = floor(t0 / G).
 
 	// Second step of Barrett reduction: Cancel out the x^n and higher terms
@@ -528,29 +548,30 @@
 	// CRC has be XORed with the physically low qword of %xmm1, representing
 	// floor(t0 / G).  The most efficient way to do that is to move it to
 	// the physically high qword and use a ternlog to combine the two XORs.
-.if LSB_CRC && \n == 64
+  .if LSB_CRC && \n == 64
 	_cond_vex punpcklqdq,	%xmm1, %xmm2, %xmm2
 	_pclmulqdq		CONSTS_XMM, LO64_TERMS, %xmm1, HI64_TERMS, %xmm1
-    .if AVX_LEVEL <= 2
+      .if AVX_LEVEL <= 2
 	_cond_vex pxor,		%xmm2, %xmm0, %xmm0
 	_cond_vex pxor,		%xmm1, %xmm0, %xmm0
-    .else
+      .else
 	vpternlogq		$0x96, %xmm2, %xmm1, %xmm0
-    .endif
+      .endif
 	_cond_vex "pextrq $1,",	%xmm0, %rax  // (%xmm0 / x^0) mod x^64
-.else
+  .else
 	_pclmulqdq		CONSTS_XMM, LO64_TERMS, %xmm1, HI64_TERMS, %xmm1
 	_cond_vex pxor,		%xmm1, %xmm0, %xmm0
-  .if \n == 8
+    .if \n == 8
 	_cond_vex "pextrb $7 + LSB_CRC,", %xmm0, %eax // (%xmm0 / x^56) mod x^8
-  .elseif \n == 16
+    .elseif \n == 16
 	_cond_vex "pextrw $3 + LSB_CRC,", %xmm0, %eax // (%xmm0 / x^48) mod x^16
-  .elseif \n == 32
+    .elseif \n == 32
 	_cond_vex "pextrd $1 + LSB_CRC,", %xmm0, %eax // (%xmm0 / x^32) mod x^32
-  .else // \n == 64 && !LSB_CRC
+    .else // \n == 64 && !LSB_CRC
 	_cond_vex movq,		%xmm0, %rax  // (%xmm0 / x^0) mod x^64
+    .endif
   .endif
-.endif
+.endif // !\crc32c_avx512
 
 .if VL > 16
 	vzeroupper	// Needed when ymm or zmm registers may have been used.
@@ -573,3 +594,8 @@ SYM_FUNC_END(prefix##_vpclmul_avx2);					\
 SYM_FUNC_START(prefix##_vpclmul_avx512);				\
 	_crc_pclmul	n=bits, lsb_crc=lsb, vl=64, avx_level=512;	\
 SYM_FUNC_END(prefix##_vpclmul_avx512);
+
+#define DEFINE_CRC32C_VPCLMUL_AVX512()					\
+SYM_FUNC_START(crc32c_vpclmul_avx512);					\
+	_crc_pclmul	n=32, lsb_crc=1, vl=64, avx_level=512, crc32c_avx512=1;\
+SYM_FUNC_END(crc32c_vpclmul_avx512);
