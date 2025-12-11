@@ -190,8 +190,8 @@ static int hctr2_finish(struct skcipher_request *req)
 	crypto_xor(rctx->first_block, digest, BLOCKCIPHER_BLOCK_SIZE);
 
 	// Copy U (or M) into dst scatterlist
-	scatterwalk_map_and_copy(rctx->first_block, req->dst,
-				 0, BLOCKCIPHER_BLOCK_SIZE, 1);
+	memcpy_to_sglist(req->dst, 0, rctx->first_block,
+			 BLOCKCIPHER_BLOCK_SIZE);
 	return 0;
 }
 
@@ -218,8 +218,8 @@ static int hctr2_crypt(struct skcipher_request *req, bool enc)
 		return -EINVAL;
 
 	// Copy M (or U) into a temporary buffer
-	scatterwalk_map_and_copy(rctx->first_block, req->src,
-				 0, BLOCKCIPHER_BLOCK_SIZE, 0);
+	memcpy_from_sglist(rctx->first_block, req->src, 0,
+			   BLOCKCIPHER_BLOCK_SIZE);
 
 	// Create scatterlists for N and V
 	rctx->bulk_part_src = scatterwalk_ffwd(rctx->sg_src, req->src,
