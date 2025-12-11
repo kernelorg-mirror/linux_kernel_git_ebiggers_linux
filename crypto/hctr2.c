@@ -47,13 +47,6 @@ struct hctr2_tfm_ctx {
 };
 
 struct hctr2_request_ctx {
-	u8 first_block[BLOCKCIPHER_BLOCK_SIZE];
-	u8 xctr_iv[BLOCKCIPHER_BLOCK_SIZE];
-	struct scatterlist *bulk_part_dst;
-	struct scatterlist *bulk_part_src;
-	struct scatterlist sg_src[2];
-	struct scatterlist sg_dst[2];
-	struct polyval_elem hashed_tweak;
 	/*
 	 * skcipher sub-request size is unknown at compile-time, so it needs to
 	 * go after the members with known sizes.
@@ -131,7 +124,8 @@ static int hctr2_setkey(struct crypto_skcipher *tfm, const u8 *key,
 	return 0;
 }
 
-static void hctr2_hash_tweak(struct skcipher_request *req)
+static void hctr2_hash_tweak(struct skcipher_request *req,
+			     struct polyval_elem *hashed_tweak)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
 	const struct hctr2_tfm_ctx *tctx = crypto_skcipher_ctx(tfm);
@@ -146,7 +140,7 @@ static void hctr2_hash_tweak(struct skcipher_request *req)
 	// Store the hashed tweak, since we need it when computing both
 	// H(T || N) and H(T || V).
 	static_assert(TWEAK_SIZE % POLYVAL_BLOCK_SIZE == 0);
-	polyval_export_blkaligned(poly_ctx, &rctx->hashed_tweak);
+	polyval_export_blkaligned(poly_ctx, hashed_tweak);
 }
 
 static void hctr2_hash_message(struct skcipher_request *req,
@@ -174,89 +168,76 @@ static void hctr2_hash_message(struct skcipher_request *req,
 	polyval_final(poly_ctx, digest);
 }
 
-static int hctr2_finish(struct skcipher_request *req)
-{
-	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
-	const struct hctr2_tfm_ctx *tctx = crypto_skcipher_ctx(tfm);
-	struct hctr2_request_ctx *rctx = skcipher_request_ctx(req);
-	struct polyval_ctx *poly_ctx = &rctx->u.poly_ctx;
-	u8 digest[POLYVAL_DIGEST_SIZE];
-
-	// U = UU ^ H(T || V)
-	// or M = MM ^ H(T || N)
-	polyval_import_blkaligned(poly_ctx, &tctx->poly_key,
-				  &rctx->hashed_tweak);
-	hctr2_hash_message(req, rctx->bulk_part_dst, digest);
-	crypto_xor(rctx->first_block, digest, BLOCKCIPHER_BLOCK_SIZE);
-
-	// Copy U (or M) into dst scatterlist
-	memcpy_to_sglist(req->dst, 0, rctx->first_block,
-			 BLOCKCIPHER_BLOCK_SIZE);
-	return 0;
-}
-
-static void hctr2_xctr_done(void *data, int err)
-{
-	struct skcipher_request *req = data;
-
-	if (!err)
-		err = hctr2_finish(req);
-
-	skcipher_request_complete(req, err);
-}
-
 static int hctr2_crypt(struct skcipher_request *req, bool enc)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
 	const struct hctr2_tfm_ctx *tctx = crypto_skcipher_ctx(tfm);
 	struct hctr2_request_ctx *rctx = skcipher_request_ctx(req);
+	struct skcipher_request *xctr_req = &rctx->u.xctr_req;
+	u8 first_block[BLOCKCIPHER_BLOCK_SIZE];
 	u8 digest[POLYVAL_DIGEST_SIZE];
-	int bulk_len = req->cryptlen - BLOCKCIPHER_BLOCK_SIZE;
+	struct polyval_elem hashed_tweak;
+	const unsigned int bulk_len = req->cryptlen - BLOCKCIPHER_BLOCK_SIZE;
+	struct scatterlist sg_src[2], sg_dst[2];
+	struct scatterlist *bulk_part_src, *bulk_part_dst;
+	int err;
 
 	// Requests must be at least one block
 	if (req->cryptlen < BLOCKCIPHER_BLOCK_SIZE)
 		return -EINVAL;
 
 	// Copy M (or U) into a temporary buffer
-	memcpy_from_sglist(rctx->first_block, req->src, 0,
-			   BLOCKCIPHER_BLOCK_SIZE);
+	memcpy_from_sglist(first_block, req->src, 0, BLOCKCIPHER_BLOCK_SIZE);
 
 	// Create scatterlists for N and V
-	rctx->bulk_part_src = scatterwalk_ffwd(rctx->sg_src, req->src,
-					       BLOCKCIPHER_BLOCK_SIZE);
-	rctx->bulk_part_dst = scatterwalk_ffwd(rctx->sg_dst, req->dst,
-					       BLOCKCIPHER_BLOCK_SIZE);
+	bulk_part_src =
+		scatterwalk_ffwd(sg_src, req->src, BLOCKCIPHER_BLOCK_SIZE);
+	bulk_part_dst =
+		scatterwalk_ffwd(sg_dst, req->dst, BLOCKCIPHER_BLOCK_SIZE);
 
 	// MM = M ^ H(T || N)
 	// or UU = U ^ H(T || V)
-	hctr2_hash_tweak(req);
-	hctr2_hash_message(req, rctx->bulk_part_src, digest);
-	crypto_xor(digest, rctx->first_block, BLOCKCIPHER_BLOCK_SIZE);
+	hctr2_hash_tweak(req, &hashed_tweak);
+	hctr2_hash_message(req, bulk_part_src, digest);
+	crypto_xor(digest, first_block, BLOCKCIPHER_BLOCK_SIZE);
 
 	// UU = E(MM)
 	// or MM = D(UU)
 	if (enc)
-		crypto_cipher_encrypt_one(tctx->blockcipher, rctx->first_block,
+		crypto_cipher_encrypt_one(tctx->blockcipher, first_block,
 					  digest);
 	else
-		crypto_cipher_decrypt_one(tctx->blockcipher, rctx->first_block,
+		crypto_cipher_decrypt_one(tctx->blockcipher, first_block,
 					  digest);
 
 	// S = MM ^ UU ^ L
-	crypto_xor(digest, rctx->first_block, BLOCKCIPHER_BLOCK_SIZE);
-	crypto_xor_cpy(rctx->xctr_iv, digest, tctx->L, BLOCKCIPHER_BLOCK_SIZE);
+	crypto_xor(digest, first_block, BLOCKCIPHER_BLOCK_SIZE);
+	crypto_xor(digest, tctx->L, BLOCKCIPHER_BLOCK_SIZE);
 
 	// V = XCTR(S, N)
 	// or N = XCTR(S, V)
-	skcipher_request_set_tfm(&rctx->u.xctr_req, tctx->xctr);
-	skcipher_request_set_crypt(&rctx->u.xctr_req, rctx->bulk_part_src,
-				   rctx->bulk_part_dst, bulk_len,
-				   rctx->xctr_iv);
-	skcipher_request_set_callback(&rctx->u.xctr_req,
-				      req->base.flags,
-				      hctr2_xctr_done, req);
-	return crypto_skcipher_encrypt(&rctx->u.xctr_req) ?:
-		hctr2_finish(req);
+	skcipher_request_set_tfm(xctr_req, tctx->xctr);
+	skcipher_request_set_callback(xctr_req, req->base.flags, NULL, NULL);
+	skcipher_request_set_crypt(xctr_req, bulk_part_src, bulk_part_dst,
+				   bulk_len, digest);
+	err = crypto_skcipher_encrypt(xctr_req);
+	if (err)
+		goto out;
+
+	// U = UU ^ H(T || V)
+	// or M = MM ^ H(T || N)
+	polyval_import_blkaligned(&rctx->u.poly_ctx, &tctx->poly_key,
+				  &hashed_tweak);
+	hctr2_hash_message(req, bulk_part_dst, digest);
+	crypto_xor(first_block, digest, BLOCKCIPHER_BLOCK_SIZE);
+
+	// Copy U (or M) into dst scatterlist
+	memcpy_to_sglist(req->dst, 0, first_block, BLOCKCIPHER_BLOCK_SIZE);
+out:
+	memzero_explicit(&hashed_tweak, sizeof(hashed_tweak));
+	memzero_explicit(digest, sizeof(digest));
+	memzero_explicit(first_block, sizeof(first_block));
+	return err;
 }
 
 static int hctr2_encrypt(struct skcipher_request *req)
@@ -344,8 +325,8 @@ static int hctr2_create_common(struct crypto_template *tmpl, struct rtattr **tb,
 
 	/* Stream cipher, xctr(block_cipher) */
 	err = crypto_grab_skcipher(&ictx->xctr_spawn,
-				   skcipher_crypto_instance(inst),
-				   xctr_name, 0, mask);
+				   skcipher_crypto_instance(inst), xctr_name, 0,
+				   mask | CRYPTO_ALG_ASYNC /* sync only */);
 	if (err)
 		goto err_free_inst;
 	xctr_alg = crypto_spawn_skcipher_alg_common(&ictx->xctr_spawn);
