@@ -156,20 +156,19 @@ static void hctr2_hash_message(struct skcipher_request *req,
 	static const u8 padding = 0x1;
 	struct hctr2_request_ctx *rctx = skcipher_request_ctx(req);
 	struct polyval_ctx *poly_ctx = &rctx->u.poly_ctx;
-	const unsigned int bulk_len = req->cryptlen - BLOCKCIPHER_BLOCK_SIZE;
-	struct sg_mapping_iter miter;
-	int i;
-	int n = 0;
+	unsigned int len = req->cryptlen - BLOCKCIPHER_BLOCK_SIZE;
+	struct scatter_walk walk;
 
-	sg_miter_start(&miter, sgl, sg_nents(sgl),
-		       SG_MITER_FROM_SG | SG_MITER_ATOMIC);
-	for (i = 0; i < bulk_len; i += n) {
-		sg_miter_next(&miter);
-		n = min_t(unsigned int, miter.length, bulk_len - i);
-		polyval_update(poly_ctx, miter.addr, n);
+	if (len) {
+		scatterwalk_start(&walk, sgl);
+		do {
+			unsigned int n = scatterwalk_next(&walk, len);
+
+			polyval_update(poly_ctx, walk.addr, n);
+			scatterwalk_done_src(&walk, n);
+			len -= n;
+		} while (len);
 	}
-	sg_miter_stop(&miter);
-
 	if (req->cryptlen % BLOCKCIPHER_BLOCK_SIZE)
 		polyval_update(poly_ctx, &padding, 1);
 	polyval_final(poly_ctx, digest);
