@@ -8,7 +8,11 @@
  *
  ******************************************************************************/
 
-#include <crypto/hash.h>
+#include <crypto/md5.h>
+#include <crypto/sha1.h>
+#include <crypto/sha2.h>
+#include <crypto/sha3.h>
+#include <linux/fips.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/err.h>
@@ -19,19 +23,109 @@
 #include "iscsi_target_nego.h"
 #include "iscsi_target_auth.h"
 
-static char *chap_get_digest_name(const int digest_type)
+#define CHAP_MAX_DIGEST_SIZE 32
+
+static const struct chap_digest_alg {
+	int digest_type;
+	int digest_size;
+	const char *digest_name;
+} chap_digest_algs[] = {
+	{
+		.digest_type = CHAP_DIGEST_MD5,
+		.digest_name = "md5",
+		.digest_size = MD5_DIGEST_SIZE,
+	},
+	{
+		.digest_type = CHAP_DIGEST_SHA1,
+		.digest_name = "sha1",
+		.digest_size = SHA1_DIGEST_SIZE,
+	},
+	{
+		.digest_type = CHAP_DIGEST_SHA256,
+		.digest_name = "sha256",
+		.digest_size = SHA256_DIGEST_SIZE,
+	},
+	{
+		.digest_type = CHAP_DIGEST_SHA3_256,
+		.digest_name = "sha3-256",
+		.digest_size = SHA3_256_DIGEST_SIZE,
+	},
+};
+
+struct chap_digest_ctx {
+	int digest_type;
+	union {
+		struct md5_ctx md5;
+		struct sha1_ctx sha1;
+		struct sha256_ctx sha256;
+		struct sha3_ctx sha3;
+	};
+};
+
+static int chap_digest_init(struct chap_digest_ctx *ctx, int digest_type)
 {
+	ctx->digest_type = digest_type;
 	switch (digest_type) {
 	case CHAP_DIGEST_MD5:
-		return "md5";
+		md5_init(&ctx->md5);
+		return 0;
 	case CHAP_DIGEST_SHA1:
-		return "sha1";
+		sha1_init(&ctx->sha1);
+		return 0;
 	case CHAP_DIGEST_SHA256:
-		return "sha256";
+		sha256_init(&ctx->sha256);
+		return 0;
 	case CHAP_DIGEST_SHA3_256:
-		return "sha3-256";
+		sha3_256_init(&ctx->sha3);
+		return 0;
 	default:
-		return NULL;
+		WARN_ON_ONCE(1);
+		return -EINVAL;
+	}
+}
+
+static void chap_digest_update(struct chap_digest_ctx *ctx,
+			       const void *data, size_t len)
+{
+	switch (ctx->digest_type) {
+	case CHAP_DIGEST_MD5:
+		md5_update(&ctx->md5, data, len);
+		break;
+	case CHAP_DIGEST_SHA1:
+		sha1_update(&ctx->sha1, data, len);
+		break;
+	case CHAP_DIGEST_SHA256:
+		sha256_update(&ctx->sha256, data, len);
+		break;
+	case CHAP_DIGEST_SHA3_256:
+		sha3_update(&ctx->sha3, data, len);
+		break;
+	default:
+		WARN_ON_ONCE(1);
+	}
+}
+
+static void chap_digest_final(struct chap_digest_ctx *ctx, u8 *out)
+{
+	switch (ctx->digest_type) {
+	case CHAP_DIGEST_MD5:
+		static_assert(CHAP_MAX_DIGEST_SIZE >= MD5_DIGEST_SIZE);
+		md5_final(&ctx->md5, out);
+		break;
+	case CHAP_DIGEST_SHA1:
+		static_assert(CHAP_MAX_DIGEST_SIZE >= SHA1_DIGEST_SIZE);
+		sha1_final(&ctx->sha1, out);
+		break;
+	case CHAP_DIGEST_SHA256:
+		static_assert(CHAP_MAX_DIGEST_SIZE >= SHA256_DIGEST_SIZE);
+		sha256_final(&ctx->sha256, out);
+		break;
+	case CHAP_DIGEST_SHA3_256:
+		static_assert(CHAP_MAX_DIGEST_SIZE >= SHA3_256_DIGEST_SIZE);
+		sha3_final(&ctx->sha3, out);
+		break;
+	default:
+		WARN_ON_ONCE(1);
 	}
 }
 
@@ -71,28 +165,16 @@ out:
 	return ret;
 }
 
-static int chap_test_algorithm(const char *name)
+static const struct chap_digest_alg *chap_parse_digest_alg(const char *a_str)
 {
-	struct crypto_shash *tfm;
-
-	tfm = crypto_alloc_shash(name, 0, 0);
-	if (IS_ERR(tfm))
-		return -1;
-
-	crypto_free_shash(tfm);
-	return 0;
-}
-
-static int chap_check_algorithm(const char *a_str)
-{
-	char *tmp, *orig, *token, *digest_name;
+	char *tmp, *orig, *token;
 	long digest_type;
-	int r = CHAP_DIGEST_UNKNOWN;
+	const struct chap_digest_alg *alg = NULL;
 
 	tmp = kstrdup(a_str, GFP_KERNEL);
 	if (!tmp) {
 		pr_err("Memory allocation failed for CHAP_A temporary buffer\n");
-		return CHAP_DIGEST_UNKNOWN;
+		return NULL;
 	}
 	orig = tmp;
 
@@ -112,21 +194,21 @@ static int chap_check_algorithm(const char *a_str)
 		if (kstrtol(token, 10, &digest_type))
 			continue;
 
-		digest_name = chap_get_digest_name(digest_type);
-		if (!digest_name)
+		if (fips_enabled && digest_type == CHAP_DIGEST_MD5)
 			continue;
 
-		pr_debug("Selected %s Algorithm\n", digest_name);
-		if (chap_test_algorithm(digest_name) < 0) {
-			pr_err("failed to allocate %s algo\n", digest_name);
-		} else {
-			r = digest_type;
-			goto out;
+		for (size_t i = 0; i < ARRAY_SIZE(chap_digest_algs); i++) {
+			if (chap_digest_algs[i].digest_type == digest_type) {
+				alg = &chap_digest_algs[i];
+				pr_debug("Selected %s Algorithm\n",
+					 alg->digest_name);
+				goto out;
+			}
 		}
 	}
 out:
 	kfree(orig);
-	return r;
+	return alg;
 }
 
 static void chap_close(struct iscsit_conn *conn)
@@ -142,7 +224,7 @@ static struct iscsi_chap *chap_server_open(
 	char *aic_str,
 	unsigned int *aic_len)
 {
-	int digest_type;
+	const struct chap_digest_alg *alg;
 	struct iscsi_chap *chap;
 
 	if (!(auth->naf_flags & NAF_USERID_SET) ||
@@ -157,36 +239,24 @@ static struct iscsi_chap *chap_server_open(
 		return NULL;
 
 	chap = conn->auth_protocol;
-	digest_type = chap_check_algorithm(a_str);
-	switch (digest_type) {
-	case CHAP_DIGEST_MD5:
-		chap->digest_size = MD5_SIGNATURE_SIZE;
-		break;
-	case CHAP_DIGEST_SHA1:
-		chap->digest_size = SHA1_SIGNATURE_SIZE;
-		break;
-	case CHAP_DIGEST_SHA256:
-		chap->digest_size = SHA256_SIGNATURE_SIZE;
-		break;
-	case CHAP_DIGEST_SHA3_256:
-		chap->digest_size = SHA3_256_SIGNATURE_SIZE;
-		break;
-	case CHAP_DIGEST_UNKNOWN:
-	default:
+	alg = chap_parse_digest_alg(a_str);
+	if (alg == NULL) {
 		pr_err("Unsupported CHAP_A value\n");
 		chap_close(conn);
 		return NULL;
 	}
 
-	chap->digest_name = chap_get_digest_name(digest_type);
+	chap->digest_name = alg->digest_name;
+	chap->digest_type = alg->digest_type;
+	chap->digest_size = alg->digest_size;
 
 	/* Tie the challenge length to the digest size */
 	chap->challenge_len = chap->digest_size;
 
-	pr_debug("[server] Got CHAP_A=%d\n", digest_type);
-	*aic_len = sprintf(aic_str, "CHAP_A=%d", digest_type);
+	pr_debug("[server] Got CHAP_A=%d\n", alg->digest_type);
+	*aic_len = sprintf(aic_str, "CHAP_A=%d", alg->digest_type);
 	*aic_len += 1;
-	pr_debug("[server] Sending CHAP_A=%d\n", digest_type);
+	pr_debug("[server] Sending CHAP_A=%d\n", alg->digest_type);
 
 	/*
 	 * Set Identifier.
@@ -255,10 +325,9 @@ static int chap_server_compute_hash(
 	unsigned char *client_digest = NULL;
 	unsigned char *server_digest = NULL;
 	unsigned char chap_n[MAX_CHAP_N_SIZE], chap_r[MAX_RESPONSE_LENGTH];
+	struct chap_digest_ctx digest_ctx;
 	size_t compare_len;
 	struct iscsi_chap *chap = conn->auth_protocol;
-	struct crypto_shash *tfm = NULL;
-	struct shash_desc *desc = NULL;
 	int auth_ret = -1, ret, initiatorchg_len;
 
 	digest = kzalloc(chap->digest_size, GFP_KERNEL);
@@ -354,46 +423,17 @@ static int chap_server_compute_hash(
 
 	pr_debug("[server] Got CHAP_R=%s\n", chap_r);
 
-	tfm = crypto_alloc_shash(chap->digest_name, 0, 0);
-	if (IS_ERR(tfm)) {
-		tfm = NULL;
-		pr_err("Unable to allocate struct crypto_shash\n");
-		goto out;
-	}
-
-	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
-	if (!desc) {
-		pr_err("Unable to allocate struct shash_desc\n");
-		goto out;
-	}
-
-	desc->tfm = tfm;
-
-	ret = crypto_shash_init(desc);
+	ret = chap_digest_init(&digest_ctx, chap->digest_type);
 	if (ret < 0) {
-		pr_err("crypto_shash_init() failed\n");
+		pr_err("chap_digest_init() failed\n");
 		goto out;
 	}
 
-	ret = crypto_shash_update(desc, &chap->id, 1);
-	if (ret < 0) {
-		pr_err("crypto_shash_update() failed for id\n");
-		goto out;
-	}
-
-	ret = crypto_shash_update(desc, (char *)&auth->password,
-				  strlen(auth->password));
-	if (ret < 0) {
-		pr_err("crypto_shash_update() failed for password\n");
-		goto out;
-	}
-
-	ret = crypto_shash_finup(desc, chap->challenge,
-				 chap->challenge_len, server_digest);
-	if (ret < 0) {
-		pr_err("crypto_shash_finup() failed for challenge\n");
-		goto out;
-	}
+	chap_digest_update(&digest_ctx, &chap->id, 1);
+	chap_digest_update(&digest_ctx, &auth->password,
+			   strlen(auth->password));
+	chap_digest_update(&digest_ctx, chap->challenge, chap->challenge_len);
+	chap_digest_final(&digest_ctx, server_digest);
 
 	bin2hex(response, server_digest, chap->digest_size);
 	pr_debug("[server] %s Server Digest: %s\n",
@@ -510,36 +550,23 @@ static int chap_server_compute_hash(
 	/*
 	 * Generate CHAP_N and CHAP_R for mutual authentication.
 	 */
-	ret = crypto_shash_init(desc);
+	ret = chap_digest_init(&digest_ctx, chap->digest_type);
 	if (ret < 0) {
-		pr_err("crypto_shash_init() failed\n");
+		pr_err("chap_digest_init() failed\n");
 		goto out;
 	}
 
 	/* To handle both endiannesses */
 	id_as_uchar = id;
-	ret = crypto_shash_update(desc, &id_as_uchar, 1);
-	if (ret < 0) {
-		pr_err("crypto_shash_update() failed for id\n");
-		goto out;
-	}
+	chap_digest_update(&digest_ctx, &id_as_uchar, 1);
 
-	ret = crypto_shash_update(desc, auth->password_mutual,
-				  strlen(auth->password_mutual));
-	if (ret < 0) {
-		pr_err("crypto_shash_update() failed for"
-				" password_mutual\n");
-		goto out;
-	}
+	chap_digest_update(&digest_ctx, auth->password_mutual,
+			   strlen(auth->password_mutual));
 	/*
 	 * Convert received challenge to binary hex.
 	 */
-	ret = crypto_shash_finup(desc, initiatorchg_binhex, initiatorchg_len,
-				 digest);
-	if (ret < 0) {
-		pr_err("crypto_shash_finup() failed for ma challenge\n");
-		goto out;
-	}
+	chap_digest_update(&digest_ctx, initiatorchg_binhex, initiatorchg_len);
+	chap_digest_final(&digest_ctx, digest);
 
 	/*
 	 * Generate CHAP_N and CHAP_R.
@@ -557,9 +584,6 @@ static int chap_server_compute_hash(
 	pr_debug("[server] Sending CHAP_R=0x%s\n", response);
 	auth_ret = 0;
 out:
-	kfree_sensitive(desc);
-	if (tfm)
-		crypto_free_shash(tfm);
 	kfree(initiatorchg);
 	kfree(initiatorchg_binhex);
 	kfree(digest);
