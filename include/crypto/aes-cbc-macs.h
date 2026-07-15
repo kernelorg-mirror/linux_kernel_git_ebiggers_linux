@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Support for AES-CMAC, AES-XCBC-MAC, and AES-CBC-MAC
+ * Support for AES-CMAC and AES-XCBC-MAC
  *
  * Copyright 2026 Google LLC
  */
@@ -130,25 +130,5 @@ static inline void aes_cmac(const struct aes_cmac_key *key, const u8 *data,
 	aes_cmac_update(&ctx, data, data_len);
 	aes_cmac_final(&ctx, out);
 }
-
-/*
- * AES-CBC-MAC support.  This is provided only for use by the implementation of
- * AES-CCM.  It should have no other users.  Warning: unlike AES-CMAC and
- * AES-XCBC-MAC, AES-CBC-MAC isn't a secure MAC for variable-length messages.
- */
-struct aes_cbcmac_ctx {
-	const struct aes_enckey *key;
-	size_t partial_len;
-	u8 h[AES_BLOCK_SIZE];
-};
-static inline void aes_cbcmac_init(struct aes_cbcmac_ctx *ctx,
-				   const struct aes_enckey *key)
-{
-	*ctx = (struct aes_cbcmac_ctx){ .key = key };
-}
-void aes_cbcmac_update(struct aes_cbcmac_ctx *ctx, const u8 *data,
-		       size_t data_len);
-void aes_cbcmac_final(struct aes_cbcmac_ctx *ctx,
-		      u8 out[at_least AES_BLOCK_SIZE]);
 
 #endif /* _CRYPTO_AES_CBC_MACS_H */

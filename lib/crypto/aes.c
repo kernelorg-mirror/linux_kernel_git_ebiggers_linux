@@ -674,49 +674,6 @@ void aes_cmac_final(struct aes_cmac_ctx *ctx, u8 out[AES_BLOCK_SIZE])
 }
 EXPORT_SYMBOL_GPL(aes_cmac_final);
 
-void aes_cbcmac_update(struct aes_cbcmac_ctx *ctx, const u8 *data,
-		       size_t data_len)
-{
-	bool enc_before = false;
-	size_t nblocks;
-
-	if (ctx->partial_len) {
-		size_t l = min(data_len, AES_BLOCK_SIZE - ctx->partial_len);
-
-		crypto_xor(&ctx->h[ctx->partial_len], data, l);
-		data += l;
-		data_len -= l;
-		ctx->partial_len += l;
-		if (ctx->partial_len < AES_BLOCK_SIZE)
-			return;
-		enc_before = true;
-	}
-
-	nblocks = data_len / AES_BLOCK_SIZE;
-	data_len %= AES_BLOCK_SIZE;
-	if (nblocks == 0) {
-		if (enc_before)
-			aes_encrypt(ctx->key, ctx->h, ctx->h);
-	} else {
-		aes_cbcmac_blocks(ctx->h, ctx->key, data, nblocks, enc_before,
-				  /* enc_after= */ true);
-		data += nblocks * AES_BLOCK_SIZE;
-	}
-	crypto_xor(ctx->h, data, data_len);
-	ctx->partial_len = data_len;
-}
-EXPORT_SYMBOL_NS_GPL(aes_cbcmac_update, "CRYPTO_INTERNAL");
-
-void aes_cbcmac_final(struct aes_cbcmac_ctx *ctx, u8 out[AES_BLOCK_SIZE])
-{
-	if (ctx->partial_len)
-		aes_encrypt(ctx->key, out, ctx->h);
-	else
-		memcpy(out, ctx->h, AES_BLOCK_SIZE);
-	memzero_explicit(ctx, sizeof(*ctx));
-}
-EXPORT_SYMBOL_NS_GPL(aes_cbcmac_final, "CRYPTO_INTERNAL");
-
 /*
  * FIPS cryptographic algorithm self-test for AES-CMAC.  As per the FIPS 140-3
  * Implementation Guidance, a cryptographic algorithm self-test for at least one

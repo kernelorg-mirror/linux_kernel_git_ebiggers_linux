@@ -141,75 +141,10 @@ static void test_aes_xcbcmac_rfc3566(struct kunit *test)
 	KUNIT_ASSERT_MEMEQ(test, actual_mac, expected_mac, AES_BLOCK_SIZE);
 }
 
-static void test_aes_cbcmac_rfc3610(struct kunit *test)
-{
-	/*
-	 * The following AES-CBC-MAC test vector is extracted from RFC 3610
-	 * Packet Vector #11.  It required some rearrangement to get the actual
-	 * input to AES-CBC-MAC from the values given.
-	 */
-	static const u8 raw_key[AES_KEYSIZE_128] = {
-		0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
-		0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf,
-	};
-	const size_t unpadded_data_len = 52;
-	static const u8 data[64] = {
-		/* clang-format off */
-		/* CCM header */
-		0x61, 0x00, 0x00, 0x00, 0x0d, 0x0c, 0x0b, 0x0a,
-		0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0x00, 0x14,
-		/* CCM additional authentication blocks */
-		0x00, 0x0c, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
-		0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x00, 0x00,
-		/* CCM message blocks */
-		0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
-		0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-		0x1c, 0x1d, 0x1e, 0x1f, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		/* clang-format on */
-	};
-	static const u8 expected_mac[AES_BLOCK_SIZE] = {
-		0x6b, 0x5e, 0x24, 0x34, 0x12, 0xcc, 0xc2, 0xad,
-		0x6f, 0x1b, 0x11, 0xc3, 0xa1, 0xa9, 0xd8, 0xbc,
-	};
-	struct aes_enckey key;
-	struct aes_cbcmac_ctx ctx;
-	u8 actual_mac[AES_BLOCK_SIZE];
-	int err;
-
-	err = aes_prepareenckey(&key, raw_key, sizeof(raw_key));
-	KUNIT_ASSERT_EQ(test, err, 0);
-
-	/*
-	 * Trailing zeroes should not affect the CBC-MAC value, up to the next
-	 * AES block boundary.
-	 */
-	for (size_t data_len = unpadded_data_len; data_len <= sizeof(data);
-	     data_len++) {
-		aes_cbcmac_init(&ctx, &key);
-		aes_cbcmac_update(&ctx, data, data_len);
-		aes_cbcmac_final(&ctx, actual_mac);
-		KUNIT_ASSERT_MEMEQ(test, actual_mac, expected_mac,
-				   AES_BLOCK_SIZE);
-
-		/* Incremental computations should produce the same result. */
-		for (size_t part1_len = 0; part1_len <= data_len; part1_len++) {
-			aes_cbcmac_init(&ctx, &key);
-			aes_cbcmac_update(&ctx, data, part1_len);
-			aes_cbcmac_update(&ctx, &data[part1_len],
-					  data_len - part1_len);
-			aes_cbcmac_final(&ctx, actual_mac);
-			KUNIT_ASSERT_MEMEQ(test, actual_mac, expected_mac,
-					   AES_BLOCK_SIZE);
-		}
-	}
-}
-
 static struct kunit_case aes_cbc_macs_test_cases[] = {
 	HASH_KUNIT_CASES,
 	KUNIT_CASE(test_aes_cmac_rfc4493),
 	KUNIT_CASE(test_aes_xcbcmac_rfc3566),
-	KUNIT_CASE(test_aes_cbcmac_rfc3610),
 	KUNIT_CASE(benchmark_hash),
 	{},
 };
@@ -222,7 +157,6 @@ static struct kunit_suite aes_cbc_macs_test_suite = {
 };
 kunit_test_suite(aes_cbc_macs_test_suite);
 
-MODULE_DESCRIPTION(
-	"KUnit tests and benchmark for AES-CMAC, AES-XCBC-MAC, and AES-CBC-MAC");
+MODULE_DESCRIPTION("KUnit tests and benchmark for AES-CMAC and AES-XCBC-MAC");
 MODULE_IMPORT_NS("CRYPTO_INTERNAL");
 MODULE_LICENSE("GPL");
