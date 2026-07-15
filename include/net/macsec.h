@@ -7,6 +7,7 @@
 #ifndef _NET_MACSEC_H_
 #define _NET_MACSEC_H_
 
+#include <crypto/aes-gcm.h>
 #include <linux/u64_stats_sync.h>
 #include <linux/if_vlan.h>
 #include <linux/workqueue.h>
@@ -63,12 +64,12 @@ typedef union pn {
 /**
  * struct macsec_key - SA key
  * @id: user-provided key identifier
- * @tfm: crypto struct, key storage
+ * @gcm_key: the AES-GCM key
  * @salt: salt used to generate IV in XPN cipher suites
  */
 struct macsec_key {
 	u8 id[MACSEC_KEYID_LEN];
-	struct crypto_aead *tfm;
+	struct aes_gcm_key gcm_key;
 	salt_t salt;
 };
 
