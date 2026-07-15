@@ -95,47 +95,6 @@ static int __maybe_unused crypto_aes_cmac_digest(struct shash_desc *desc,
 	return 0;
 }
 
-#define AES_CBCMAC_KEY(tfm) ((struct aes_enckey *)crypto_shash_ctx(tfm))
-#define AES_CBCMAC_CTX(desc) ((struct aes_cbcmac_ctx *)shash_desc_ctx(desc))
-
-static int __maybe_unused crypto_aes_cbcmac_setkey(struct crypto_shash *tfm,
-						   const u8 *in_key,
-						   unsigned int key_len)
-{
-	return aes_prepareenckey(AES_CBCMAC_KEY(tfm), in_key, key_len);
-}
-
-static int __maybe_unused crypto_aes_cbcmac_init(struct shash_desc *desc)
-{
-	aes_cbcmac_init(AES_CBCMAC_CTX(desc), AES_CBCMAC_KEY(desc->tfm));
-	return 0;
-}
-
-static int __maybe_unused crypto_aes_cbcmac_update(struct shash_desc *desc,
-						   const u8 *data,
-						   unsigned int len)
-{
-	aes_cbcmac_update(AES_CBCMAC_CTX(desc), data, len);
-	return 0;
-}
-
-static int __maybe_unused crypto_aes_cbcmac_final(struct shash_desc *desc,
-						  u8 *out)
-{
-	aes_cbcmac_final(AES_CBCMAC_CTX(desc), out);
-	return 0;
-}
-
-static int __maybe_unused crypto_aes_cbcmac_digest(struct shash_desc *desc,
-						   const u8 *data,
-						   unsigned int len, u8 *out)
-{
-	aes_cbcmac_init(AES_CBCMAC_CTX(desc), AES_CBCMAC_KEY(desc->tfm));
-	aes_cbcmac_update(AES_CBCMAC_CTX(desc), data, len);
-	aes_cbcmac_final(AES_CBCMAC_CTX(desc), out);
-	return 0;
-}
-
 static struct crypto_alg alg = {
 	.cra_name = "aes",
 	.cra_driver_name = "aes-lib",
@@ -188,23 +147,6 @@ static struct shash_alg mac_algs[] = {
 		.final = crypto_aes_cmac_final,
 		.digest = crypto_aes_cmac_digest,
 		.descsize = sizeof(struct aes_cmac_ctx),
-	},
-#endif
-#if IS_ENABLED(CONFIG_CRYPTO_CCM)
-	{
-		.base.cra_name = "cbcmac(aes)",
-		.base.cra_driver_name = "cbcmac-aes-lib",
-		.base.cra_priority = 300,
-		.base.cra_blocksize = AES_BLOCK_SIZE,
-		.base.cra_ctxsize = sizeof(struct aes_enckey),
-		.base.cra_module = THIS_MODULE,
-		.digestsize = AES_BLOCK_SIZE,
-		.setkey = crypto_aes_cbcmac_setkey,
-		.init = crypto_aes_cbcmac_init,
-		.update = crypto_aes_cbcmac_update,
-		.final = crypto_aes_cbcmac_final,
-		.digest = crypto_aes_cbcmac_digest,
-		.descsize = sizeof(struct aes_cbcmac_ctx),
 	},
 #endif
 };
@@ -1096,10 +1038,6 @@ MODULE_ALIAS_CRYPTO("cmac-aes-lib");
 #if IS_ENABLED(CONFIG_CRYPTO_XCBC)
 MODULE_ALIAS_CRYPTO("xcbc(aes)");
 MODULE_ALIAS_CRYPTO("xcbc-aes-lib");
-#endif
-#if IS_ENABLED(CONFIG_CRYPTO_CCM)
-MODULE_ALIAS_CRYPTO("cbcmac(aes)");
-MODULE_ALIAS_CRYPTO("cbcmac-aes-lib");
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_ECB)
 MODULE_ALIAS_CRYPTO("ecb(aes)");
