@@ -4,6 +4,8 @@
  *   Copyright (C) 2018 Samsung Electronics Co., Ltd.
  */
 
+#include <crypto/aes-ccm.h>
+#include <crypto/aes-gcm.h>
 #include <crypto/utils.h>
 #include <linux/inetdevice.h>
 #include <net/addrconf.h>
@@ -9728,9 +9730,28 @@ static void fill_transform_hdr(void *tr_buf, char *old_buf, __le16 cipher_type)
 
 int smb3_encrypt_resp(struct ksmbd_work *work)
 {
+	struct ksmbd_session *sess = work->sess;
+	__le16 cipher_type = work->conn->cipher_type;
 	struct kvec *iov = work->iov;
+	unsigned int nvec = work->iov_idx + 1;
 	int rc = -ENOMEM;
 	void *tr_buf;
+	struct smb2_transform_hdr *tr_hdr;
+	union {
+		struct {
+			struct aes_gcm_key key;
+			struct aes_gcm_ctx ctx;
+		} gcm;
+		struct {
+			struct aes_ccm_key key;
+			struct aes_ccm_ctx ctx;
+		} ccm;
+	} u;
+	u8 *assoc_data;
+	size_t orig_size, assoc_data_size;
+
+	if (!sess)
+		return -EINVAL;
 
 	tr_buf = kzalloc(sizeof(struct smb2_transform_hdr) + 4, KSMBD_DEFAULT_GFP);
 	if (!tr_buf)
@@ -9739,11 +9760,61 @@ int smb3_encrypt_resp(struct ksmbd_work *work)
 	/* fill transform header */
 	fill_transform_hdr(tr_buf, work->response_buf, work->conn->cipher_type);
 
-	iov[0].iov_base = tr_buf;
-	iov[0].iov_len = sizeof(struct smb2_transform_hdr) + 4;
 	work->tr_buf = tr_buf;
 
-	return ksmbd_crypt_message(work, iov, work->iov_idx + 1, 1);
+	tr_hdr = smb_get_msg(tr_buf);
+	orig_size = le32_to_cpu(tr_hdr->OriginalMessageSize);
+	assoc_data = tr_buf + 24;
+	assoc_data_size = sizeof(struct smb2_transform_hdr) - 20;
+
+	iov[0].iov_base = tr_buf;
+	iov[0].iov_len = sizeof(struct smb2_transform_hdr) + 4;
+
+	if (cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
+	    cipher_type == SMB2_ENCRYPTION_AES256_GCM) {
+		size_t key_size = (cipher_type == SMB2_ENCRYPTION_AES128_GCM) ?
+					  AES_KEYSIZE_128 :
+					  AES_KEYSIZE_256;
+
+		rc = aes_gcm_preparekey(&u.gcm.key, sess->smb3encryptionkey,
+					key_size, SMB2_SIGNATURE_SIZE);
+		if (rc)
+			goto out;
+		aes_gcm_init(&u.gcm.ctx, tr_hdr->Nonce, &u.gcm.key);
+		aes_gcm_auth_update(&u.gcm.ctx, assoc_data, assoc_data_size);
+		for (unsigned int i = 1; i < nvec; i++)
+			aes_gcm_encrypt_update(&u.gcm.ctx, iov[i].iov_base,
+					       iov[i].iov_base, iov[i].iov_len);
+		aes_gcm_encrypt_final(&u.gcm.ctx, tr_hdr->Signature);
+		rc = 0;
+	} else if (cipher_type == SMB2_ENCRYPTION_AES128_CCM ||
+		   cipher_type == SMB2_ENCRYPTION_AES256_CCM) {
+		size_t key_size = (cipher_type == SMB2_ENCRYPTION_AES128_CCM) ?
+					  AES_KEYSIZE_128 :
+					  AES_KEYSIZE_256;
+
+		rc = aes_ccm_preparekey(&u.ccm.key, sess->smb3encryptionkey,
+					key_size, SMB2_SIGNATURE_SIZE);
+		if (rc)
+			goto out;
+		rc = aes_ccm_init(&u.ccm.ctx, orig_size, assoc_data_size,
+				  tr_hdr->Nonce, SMB3_AES_CCM_NONCE,
+				  &u.ccm.key);
+		if (rc)
+			goto out;
+		aes_ccm_auth_update(&u.ccm.ctx, assoc_data, assoc_data_size);
+		for (unsigned int i = 1; i < nvec; i++)
+			aes_ccm_encrypt_update(&u.ccm.ctx, iov[i].iov_base,
+					       iov[i].iov_base, iov[i].iov_len);
+		aes_ccm_encrypt_final(&u.ccm.ctx, tr_hdr->Signature);
+		rc = 0;
+	} else {
+		WARN_ON_ONCE(1);
+		rc = -EOPNOTSUPP;
+	}
+out:
+	memzero_explicit(&u, sizeof(u));
+	return rc;
 }
 
 bool smb3_is_transform_hdr(void *buf)
@@ -9756,11 +9827,17 @@ bool smb3_is_transform_hdr(void *buf)
 int smb3_decrypt_req(struct ksmbd_work *work)
 {
 	struct ksmbd_session *sess;
+	__le16 cipher_type = work->conn->cipher_type;
 	char *buf = work->request_buf;
 	unsigned int pdu_length = get_rfc1002_len(buf);
-	struct kvec iov[2];
 	int buf_data_size = pdu_length - sizeof(struct smb2_transform_hdr);
 	struct smb2_transform_hdr *tr_hdr = smb_get_msg(buf);
+	union {
+		struct aes_gcm_key gcm;
+		struct aes_ccm_key ccm;
+	} key;
+	u8 *data, *assoc_data;
+	size_t orig_size, assoc_data_size;
 	int rc = 0;
 
 	if (pdu_length < sizeof(struct smb2_transform_hdr) ||
@@ -9770,10 +9847,14 @@ int smb3_decrypt_req(struct ksmbd_work *work)
 		return -ECONNABORTED;
 	}
 
-	if (buf_data_size < le32_to_cpu(tr_hdr->OriginalMessageSize)) {
+	orig_size = le32_to_cpu(tr_hdr->OriginalMessageSize);
+	if (buf_data_size < orig_size) {
 		pr_err("Transform message is broken\n");
 		return -ECONNABORTED;
 	}
+	data = buf + sizeof(struct smb2_transform_hdr) + 4;
+	assoc_data = buf + 24;
+	assoc_data_size = sizeof(struct smb2_transform_hdr) - 20;
 
 	sess = ksmbd_session_lookup_all(work->conn, le64_to_cpu(tr_hdr->SessionId));
 	if (!sess) {
@@ -9781,19 +9862,46 @@ int smb3_decrypt_req(struct ksmbd_work *work)
 		       le64_to_cpu(tr_hdr->SessionId));
 		return -ECONNABORTED;
 	}
+
+	if (cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
+	    cipher_type == SMB2_ENCRYPTION_AES256_GCM) {
+		size_t key_size = (cipher_type == SMB2_ENCRYPTION_AES128_GCM) ?
+					  AES_KEYSIZE_128 :
+					  AES_KEYSIZE_256;
+
+		rc = aes_gcm_preparekey(&key.gcm, sess->smb3decryptionkey,
+					key_size, SMB2_SIGNATURE_SIZE);
+		if (rc)
+			goto put_session;
+		rc = aes_gcm_decrypt(data, data, orig_size, tr_hdr->Signature,
+				     assoc_data, assoc_data_size, tr_hdr->Nonce,
+				     &key.gcm);
+	} else if (cipher_type == SMB2_ENCRYPTION_AES128_CCM ||
+		   cipher_type == SMB2_ENCRYPTION_AES256_CCM) {
+		size_t key_size = (cipher_type == SMB2_ENCRYPTION_AES128_CCM) ?
+					  AES_KEYSIZE_128 :
+					  AES_KEYSIZE_256;
+
+		rc = aes_ccm_preparekey(&key.ccm, sess->smb3decryptionkey,
+					key_size, SMB2_SIGNATURE_SIZE);
+		if (rc)
+			goto put_session;
+		rc = aes_ccm_decrypt(data, data, orig_size, tr_hdr->Signature,
+				     assoc_data, assoc_data_size, tr_hdr->Nonce,
+				     SMB3_AES_CCM_NONCE, &key.ccm);
+	} else {
+		WARN_ON_ONCE(1);
+		rc = -EOPNOTSUPP;
+	}
+put_session:
 	ksmbd_user_session_put(sess);
-
-	iov[0].iov_base = buf;
-	iov[0].iov_len = sizeof(struct smb2_transform_hdr) + 4;
-	iov[1].iov_base = buf + sizeof(struct smb2_transform_hdr) + 4;
-	iov[1].iov_len = buf_data_size;
-	rc = ksmbd_crypt_message(work, iov, 2, 0);
 	if (rc)
-		return rc;
+		goto out;
 
-	memmove(buf + 4, iov[1].iov_base, buf_data_size);
+	memmove(buf + 4, data, buf_data_size);
 	*(__be32 *)buf = cpu_to_be32(buf_data_size);
-
+out:
+	memzero_explicit(&key, sizeof(key));
 	return rc;
 }
 

@@ -11,27 +11,23 @@
 #include <linux/writeback.h>
 #include <linux/uio.h>
 #include <linux/xattr.h>
-#include <crypto/aead.h>
 #include <crypto/aes-cbc-macs.h>
 #include <crypto/md5.h>
 #include <crypto/sha2.h>
 #include <crypto/utils.h>
 #include <linux/random.h>
-#include <linux/scatterlist.h>
 
 #include "auth.h"
 #include "glob.h"
 
 #include <linux/fips.h>
 #include <crypto/arc4.h>
-#include <crypto/des.h>
 
 #include "server.h"
 #include "smb_common.h"
 #include "connection.h"
 #include "mgmt/user_session.h"
 #include "mgmt/user_config.h"
-#include "crypto_ctx.h"
 #include "transport_ipc.h"
 
 /*
@@ -699,227 +695,4 @@ int ksmbd_gen_preauth_integrity_hash(struct ksmbd_conn *conn, char *buf,
 	sha512_update(&sha_ctx, all_bytes_msg, msg_size);
 	sha512_final(&sha_ctx, pi_hash);
 	return 0;
-}
-
-static int ksmbd_get_encryption_key(struct ksmbd_work *work, __u64 ses_id,
-				    int enc, u8 *key)
-{
-	struct ksmbd_session *sess;
-	u8 *ses_enc_key;
-
-	if (enc)
-		sess = work->sess;
-	else
-		sess = ksmbd_session_lookup_all(work->conn, ses_id);
-	if (!sess)
-		return -EINVAL;
-
-	ses_enc_key = enc ? sess->smb3encryptionkey :
-		sess->smb3decryptionkey;
-	memcpy(key, ses_enc_key, SMB3_ENC_DEC_KEY_SIZE);
-	if (!enc)
-		ksmbd_user_session_put(sess);
-
-	return 0;
-}
-
-static inline void smb2_sg_set_buf(struct scatterlist *sg, const void *buf,
-				   unsigned int buflen)
-{
-	void *addr;
-
-	if (is_vmalloc_addr(buf))
-		addr = vmalloc_to_page(buf);
-	else
-		addr = virt_to_page(buf);
-	sg_set_page(sg, addr, buflen, offset_in_page(buf));
-}
-
-static struct scatterlist *ksmbd_init_sg(struct kvec *iov, unsigned int nvec,
-					 u8 *sign)
-{
-	struct scatterlist *sg;
-	unsigned int assoc_data_len = sizeof(struct smb2_transform_hdr) - 20;
-	int i, *nr_entries, total_entries = 0, sg_idx = 0;
-
-	if (!nvec)
-		return NULL;
-
-	nr_entries = kzalloc_objs(int, nvec, KSMBD_DEFAULT_GFP);
-	if (!nr_entries)
-		return NULL;
-
-	for (i = 0; i < nvec - 1; i++) {
-		unsigned long kaddr = (unsigned long)iov[i + 1].iov_base;
-
-		if (is_vmalloc_addr(iov[i + 1].iov_base)) {
-			nr_entries[i] = ((kaddr + iov[i + 1].iov_len +
-					PAGE_SIZE - 1) >> PAGE_SHIFT) -
-				(kaddr >> PAGE_SHIFT);
-		} else {
-			nr_entries[i]++;
-		}
-		total_entries += nr_entries[i];
-	}
-
-	/* Add two entries for transform header and signature */
-	total_entries += 2;
-
-	sg = kmalloc_objs(struct scatterlist, total_entries, KSMBD_DEFAULT_GFP);
-	if (!sg) {
-		kfree(nr_entries);
-		return NULL;
-	}
-
-	sg_init_table(sg, total_entries);
-	smb2_sg_set_buf(&sg[sg_idx++], iov[0].iov_base + 24, assoc_data_len);
-	for (i = 0; i < nvec - 1; i++) {
-		void *data = iov[i + 1].iov_base;
-		int len = iov[i + 1].iov_len;
-
-		if (is_vmalloc_addr(data)) {
-			int j, offset = offset_in_page(data);
-
-			for (j = 0; j < nr_entries[i]; j++) {
-				unsigned int bytes = PAGE_SIZE - offset;
-
-				if (!len)
-					break;
-
-				if (bytes > len)
-					bytes = len;
-
-				sg_set_page(&sg[sg_idx++],
-					    vmalloc_to_page(data), bytes,
-					    offset_in_page(data));
-
-				data += bytes;
-				len -= bytes;
-				offset = 0;
-			}
-		} else {
-			sg_set_page(&sg[sg_idx++], virt_to_page(data), len,
-				    offset_in_page(data));
-		}
-	}
-	smb2_sg_set_buf(&sg[sg_idx], sign, SMB2_SIGNATURE_SIZE);
-	kfree(nr_entries);
-	return sg;
-}
-
-int ksmbd_crypt_message(struct ksmbd_work *work, struct kvec *iov,
-			unsigned int nvec, int enc)
-{
-	struct ksmbd_conn *conn = work->conn;
-	struct smb2_transform_hdr *tr_hdr = smb_get_msg(iov[0].iov_base);
-	unsigned int assoc_data_len = sizeof(struct smb2_transform_hdr) - 20;
-	int rc;
-	DECLARE_CRYPTO_WAIT(wait);
-	struct scatterlist *sg;
-	u8 sign[SMB2_SIGNATURE_SIZE] = {};
-	u8 key[SMB3_ENC_DEC_KEY_SIZE];
-	struct aead_request *req;
-	char *iv;
-	unsigned int iv_len;
-	struct crypto_aead *tfm;
-	unsigned int crypt_len = le32_to_cpu(tr_hdr->OriginalMessageSize);
-	struct ksmbd_crypto_ctx *ctx;
-
-	rc = ksmbd_get_encryption_key(work,
-				      le64_to_cpu(tr_hdr->SessionId),
-				      enc,
-				      key);
-	if (rc) {
-		pr_err("Could not get %scryption key\n", enc ? "en" : "de");
-		return rc;
-	}
-
-	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
-	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM)
-		ctx = ksmbd_crypto_ctx_find_gcm();
-	else
-		ctx = ksmbd_crypto_ctx_find_ccm();
-	if (!ctx) {
-		pr_err("crypto alloc failed\n");
-		return -ENOMEM;
-	}
-
-	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
-	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM)
-		tfm = CRYPTO_GCM(ctx);
-	else
-		tfm = CRYPTO_CCM(ctx);
-
-	if (conn->cipher_type == SMB2_ENCRYPTION_AES256_CCM ||
-	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM)
-		rc = crypto_aead_setkey(tfm, key, SMB3_GCM256_CRYPTKEY_SIZE);
-	else
-		rc = crypto_aead_setkey(tfm, key, SMB3_GCM128_CRYPTKEY_SIZE);
-	if (rc) {
-		pr_err("Failed to set aead key %d\n", rc);
-		goto free_ctx;
-	}
-
-	rc = crypto_aead_setauthsize(tfm, SMB2_SIGNATURE_SIZE);
-	if (rc) {
-		pr_err("Failed to set authsize %d\n", rc);
-		goto free_ctx;
-	}
-
-	req = aead_request_alloc(tfm, KSMBD_DEFAULT_GFP);
-	if (!req) {
-		rc = -ENOMEM;
-		goto free_ctx;
-	}
-
-	if (!enc) {
-		memcpy(sign, &tr_hdr->Signature, SMB2_SIGNATURE_SIZE);
-		crypt_len += SMB2_SIGNATURE_SIZE;
-	}
-
-	sg = ksmbd_init_sg(iov, nvec, sign);
-	if (!sg) {
-		pr_err("Failed to init sg\n");
-		rc = -ENOMEM;
-		goto free_req;
-	}
-
-	iv_len = crypto_aead_ivsize(tfm);
-	iv = kzalloc(iv_len, KSMBD_DEFAULT_GFP);
-	if (!iv) {
-		rc = -ENOMEM;
-		goto free_sg;
-	}
-
-	if (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
-	    conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM) {
-		memcpy(iv, (char *)tr_hdr->Nonce, SMB3_AES_GCM_NONCE);
-	} else {
-		iv[0] = 3;
-		memcpy(iv + 1, (char *)tr_hdr->Nonce, SMB3_AES_CCM_NONCE);
-	}
-
-	aead_request_set_crypt(req, sg, sg, crypt_len, iv);
-	aead_request_set_ad(req, assoc_data_len);
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG |
-				  CRYPTO_TFM_REQ_MAY_SLEEP,
-				  crypto_req_done, &wait);
-
-	rc = crypto_wait_req(enc ? crypto_aead_encrypt(req) :
-			     crypto_aead_decrypt(req), &wait);
-	if (rc)
-		goto free_iv;
-
-	if (enc)
-		memcpy(&tr_hdr->Signature, sign, SMB2_SIGNATURE_SIZE);
-
-free_iv:
-	kfree(iv);
-free_sg:
-	kfree(sg);
-free_req:
-	aead_request_free(req);
-free_ctx:
-	ksmbd_release_crypto_ctx(ctx);
-	return rc;
 }

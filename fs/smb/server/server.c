@@ -19,7 +19,6 @@
 #include "connection.h"
 #include "transport_ipc.h"
 #include "mgmt/user_session.h"
-#include "crypto_ctx.h"
 #include "auth.h"
 #include "stats.h"
 #include "compress.h"
@@ -550,7 +549,6 @@ static int ksmbd_server_shutdown(void)
 	ksmbd_workqueue_destroy();
 	ksmbd_ipc_release();
 	ksmbd_conn_transport_destroy();
-	ksmbd_crypto_destroy();
 	ksmbd_free_global_file_table();
 	destroy_lease_table(NULL);
 	ksmbd_work_pool_destroy();
@@ -598,13 +596,9 @@ static int __init ksmbd_server_init(void)
 	if (ret)
 		goto err_destroy_file_table;
 
-	ret = ksmbd_crypto_create();
-	if (ret)
-		goto err_release_inode_hash;
-
 	ret = ksmbd_workqueue_init();
 	if (ret)
-		goto err_crypto_destroy;
+		goto err_release_inode_hash;
 
 	ret = ksmbd_conn_wq_init();
 	if (ret)
@@ -614,8 +608,6 @@ static int __init ksmbd_server_init(void)
 
 err_workqueue_destroy:
 	ksmbd_workqueue_destroy();
-err_crypto_destroy:
-	ksmbd_crypto_destroy();
 err_release_inode_hash:
 	ksmbd_release_inode_hash();
 err_destroy_file_table:
@@ -652,9 +644,5 @@ MODULE_AUTHOR("Namjae Jeon <linkinjeon@kernel.org>");
 MODULE_DESCRIPTION("Linux kernel CIFS/SMB SERVER");
 MODULE_LICENSE("GPL");
 MODULE_SOFTDEP("pre: nls");
-MODULE_SOFTDEP("pre: aes");
-MODULE_SOFTDEP("pre: aead2");
-MODULE_SOFTDEP("pre: ccm");
-MODULE_SOFTDEP("pre: gcm");
 module_init(ksmbd_server_init)
 module_exit(ksmbd_server_exit)
