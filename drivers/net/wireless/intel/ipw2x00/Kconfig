@@ -153,8 +153,8 @@ config LIBIPW
 	tristate
 	depends on PCI && CFG80211
 	select WIRELESS_EXT
-	select CRYPTO
 	select CRYPTO_LIB_ARC4
+	select CRYPTO_LIB_AES_CCM
 	select CRC32
 	help
 	This option enables the hardware independent IEEE 802.11
