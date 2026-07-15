@@ -13,6 +13,7 @@
 #include <linux/crypto.h>
 #include <linux/rcupdate.h>
 #include <crypto/aes-cbc-macs.h>
+#include <crypto/aes-gcm.h>
 #include <crypto/arc4.h>
 #include <net/mac80211.h>
 
@@ -100,7 +101,7 @@ struct ieee80211_key {
 		} aes_cmac;
 		struct {
 			u8 rx_pn[IEEE80211_GMAC_PN_LEN];
-			struct crypto_aead *tfm;
+			struct aes_gcm_key key;
 			u32 replays; /* dot11RSNAStatsCMACReplays */
 			u32 icverrors; /* dot11RSNAStatsCMACICVErrors */
 		} aes_gmac;

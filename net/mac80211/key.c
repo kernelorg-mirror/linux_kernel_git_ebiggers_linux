@@ -711,10 +711,9 @@ ieee80211_key_alloc(u32 cipher, int idx, size_t key_len,
 		/* Initialize AES key state here as an optimization so that
 		 * it does not need to be initialized for every packet.
 		 */
-		key->u.aes_gmac.tfm =
-			ieee80211_aes_gmac_key_setup(key_data, key_len);
-		if (IS_ERR(key->u.aes_gmac.tfm)) {
-			err = PTR_ERR(key->u.aes_gmac.tfm);
+		err = aes_gcm_preparekey(&key->u.aes_gmac.key, key_data,
+					 key_len, IEEE80211_GMAC_MIC_LEN);
+		if (err) {
 			kfree(key);
 			return ERR_PTR(err);
 		}
@@ -751,10 +750,6 @@ static void ieee80211_key_free_common(struct ieee80211_key *key)
 	case WLAN_CIPHER_SUITE_CCMP:
 	case WLAN_CIPHER_SUITE_CCMP_256:
 		ieee80211_aes_key_free(key->u.ccmp.tfm);
-		break;
-	case WLAN_CIPHER_SUITE_BIP_GMAC_128:
-	case WLAN_CIPHER_SUITE_BIP_GMAC_256:
-		ieee80211_aes_gmac_key_free(key->u.aes_gmac.tfm);
 		break;
 	case WLAN_CIPHER_SUITE_GCMP:
 	case WLAN_CIPHER_SUITE_GCMP_256:
