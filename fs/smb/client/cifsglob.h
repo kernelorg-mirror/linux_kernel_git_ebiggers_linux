@@ -13,7 +13,6 @@
 #include <linux/in6.h>
 #include <linux/inet.h>
 #include <linux/slab.h>
-#include <linux/scatterlist.h>
 #include <linux/mm.h>
 #include <linux/mempool.h>
 #include <linux/workqueue.h>
@@ -218,12 +217,6 @@ static inline const char *cifs_symlink_type_str(enum cifs_symlink_type type)
 struct session_key {
 	unsigned int len;
 	char *response;
-};
-
-/* encryption related structure/fields, not specific to a sec mech */
-struct cifs_secmech {
-	struct crypto_aead *enc; /* smb3 encryption AEAD TFM (AES-CCM and AES-GCM) */
-	struct crypto_aead *dec; /* smb3 decryption AEAD TFM (AES-CCM and AES-GCM) */
 };
 
 /* per smb session structure/fields */
@@ -745,7 +738,6 @@ struct TCP_Server_Info {
 	unsigned long lstrp; /* when we got last response from this server */
 	unsigned long neg_start; /* when negotiate started (jiffies) */
 	unsigned long reconn_delay; /* when resched session and tcon reconnect */
-	struct cifs_secmech secmech; /* crypto sec mech functs, descriptors */
 #define	CIFS_NEGFLAVOR_UNENCAP	1	/* wct == 17, but no ext_sec */
 #define	CIFS_NEGFLAVOR_EXTENDED	2	/* wct == 17, ext_sec bit set */
 	char	negflavor;	/* NEGOTIATE response flavor */

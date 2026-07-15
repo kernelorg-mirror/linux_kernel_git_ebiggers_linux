@@ -21,7 +21,6 @@
 #include <linux/highmem.h>
 #include <linux/fips.h>
 #include <linux/iov_iter.h>
-#include <crypto/aead.h>
 #include <crypto/aes-cbc-macs.h>
 #include <crypto/arc4.h>
 #include <crypto/md5.h>
@@ -498,17 +497,4 @@ calc_seckey(struct cifs_ses *ses)
 	memzero_explicit(sec_key, CIFS_SESS_KEY_SIZE);
 	kfree_sensitive(ctx_arc4);
 	return 0;
-}
-
-void
-cifs_crypto_secmech_release(struct TCP_Server_Info *server)
-{
-	if (server->secmech.enc) {
-		crypto_free_aead(server->secmech.enc);
-		server->secmech.enc = NULL;
-	}
-	if (server->secmech.dec) {
-		crypto_free_aead(server->secmech.dec);
-		server->secmech.dec = NULL;
-	}
 }

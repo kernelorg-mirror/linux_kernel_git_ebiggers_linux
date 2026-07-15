@@ -2198,9 +2198,5 @@ MODULE_DESCRIPTION
 	"also older servers complying with the SNIA CIFS Specification)");
 MODULE_VERSION(CIFS_VERSION);
 MODULE_SOFTDEP("nls");
-MODULE_SOFTDEP("aes");
-MODULE_SOFTDEP("aead2");
-MODULE_SOFTDEP("ccm");
-MODULE_SOFTDEP("gcm");
 module_init(init_cifs)
 module_exit(exit_cifs)

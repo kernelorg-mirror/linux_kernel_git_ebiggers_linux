@@ -5,13 +5,14 @@
  *  Copyright (c) 2012, Jeff Layton <jlayton@redhat.com>
  */
 
+#include <crypto/aes-ccm.h>
+#include <crypto/aes-gcm.h>
+#include <linux/iov_iter.h>
 #include <linux/pagemap.h>
 #include <linux/vfs.h>
 #include <linux/falloc.h>
-#include <linux/scatterlist.h>
 #include <linux/uuid.h>
 #include <linux/sort.h>
-#include <crypto/aead.h>
 #include <linux/fiemap.h>
 #include <linux/folio_queue.h>
 #include <uapi/linux/magic.h>
@@ -4351,86 +4352,82 @@ fill_transform_hdr(struct smb2_transform_hdr *tr_hdr, unsigned int orig_len,
 	memcpy(&tr_hdr->SessionId, &shdr->SessionId, 8);
 }
 
-static void *smb2_aead_req_alloc(struct crypto_aead *tfm, const struct smb_rqst *rqst,
-				 int num_rqst, const u8 *sig, u8 **iv,
-				 struct aead_request **req, struct sg_table *sgt,
-				 unsigned int *num_sgs)
+struct smb3_crypt_ctx {
+	union {
+		struct aes_gcm_ctx gcm;
+		struct aes_ccm_ctx ccm;
+	};
+	__le16 cipher_type;
+	int enc;
+};
+
+static size_t smb3_crypt_step(void *data, size_t progress, size_t len,
+			      void *priv, void *priv2)
 {
-	unsigned int req_size = sizeof(**req) + crypto_aead_reqsize(tfm);
-	unsigned int iv_size = crypto_aead_ivsize(tfm);
-	unsigned int len;
-	int ret;
-	u8 *p;
+	struct smb3_crypt_ctx *ctx = priv;
 
-	ret = cifs_get_num_sgs(rqst, num_rqst, sig);
-	if (ret < 0)
-		return ERR_PTR(ret);
-	*num_sgs = ret;
-
-	len = iv_size;
-	len += crypto_aead_alignmask(tfm) & ~(crypto_tfm_ctx_alignment() - 1);
-	len = ALIGN(len, crypto_tfm_ctx_alignment());
-	len += req_size;
-	len = ALIGN(len, __alignof__(struct scatterlist));
-	len += array_size(*num_sgs, sizeof(struct scatterlist));
-
-	p = kzalloc(len, GFP_NOFS);
-	if (!p)
-		return ERR_PTR(-ENOMEM);
-
-	*iv = (u8 *)PTR_ALIGN(p, crypto_aead_alignmask(tfm) + 1);
-	*req = (struct aead_request *)PTR_ALIGN(*iv + iv_size,
-						crypto_tfm_ctx_alignment());
-	sgt->sgl = (struct scatterlist *)PTR_ALIGN((u8 *)*req + req_size,
-						   __alignof__(struct scatterlist));
-	return p;
+	switch (ctx->cipher_type) {
+	case SMB2_ENCRYPTION_AES128_GCM:
+	case SMB2_ENCRYPTION_AES256_GCM:
+		if (ctx->enc)
+			aes_gcm_encrypt_update(&ctx->gcm, data, data, len);
+		else
+			aes_gcm_decrypt_update(&ctx->gcm, data, data, len);
+		return 0;
+	case SMB2_ENCRYPTION_AES128_CCM:
+	case SMB2_ENCRYPTION_AES256_CCM:
+		if (ctx->enc)
+			aes_ccm_encrypt_update(&ctx->ccm, data, data, len);
+		else
+			aes_ccm_decrypt_update(&ctx->ccm, data, data, len);
+		return 0;
+	default:
+		WARN_ON_ONCE(1);
+		return len;
+	}
 }
 
-static void *smb2_get_aead_req(struct crypto_aead *tfm, struct smb_rqst *rqst,
-			       int num_rqst, const u8 *sig, u8 **iv,
-			       struct aead_request **req, struct scatterlist **sgl)
+static int smb3_crypt_rqst(struct smb_rqst *rqst, struct smb3_crypt_ctx *ctx,
+			   unsigned int start_vec, unsigned int *remaining)
 {
-	struct sg_table sgtable = {};
-	unsigned int skip, num_sgs, i, j;
-	ssize_t rc;
-	void *p;
+	for (unsigned int i = start_vec; i < rqst->rq_nvec; i++) {
+		size_t len = min(rqst->rq_iov[i].iov_len, *remaining);
 
-	p = smb2_aead_req_alloc(tfm, rqst, num_rqst, sig, iv, req, &sgtable, &num_sgs);
-	if (IS_ERR(p))
-		return ERR_CAST(p);
-
-	sg_init_marker(sgtable.sgl, num_sgs);
-
-	/*
-	 * The first rqst has a transform header where the
-	 * first 20 bytes are not part of the encrypted blob.
-	 */
-	skip = 20;
-
-	for (i = 0; i < num_rqst; i++) {
-		struct iov_iter *iter = &rqst[i].rq_iter;
-		size_t count = iov_iter_count(iter);
-
-		for (j = 0; j < rqst[i].rq_nvec; j++) {
-			cifs_sg_set_buf(&sgtable,
-					rqst[i].rq_iov[j].iov_base + skip,
-					rqst[i].rq_iov[j].iov_len - skip);
-
-			/* See the above comment on the 'skip' assignment */
-			skip = 0;
-		}
-		sgtable.orig_nents = sgtable.nents;
-
-		rc = extract_iter_to_sg(iter, count, &sgtable,
-					num_sgs - sgtable.nents, 0);
-		iov_iter_revert(iter, rc);
-		sgtable.orig_nents = sgtable.nents;
+		smb3_crypt_step(rqst->rq_iov[i].iov_base, 0, len, ctx, NULL);
+		*remaining -= len;
 	}
+	if (*remaining > 0 && iov_iter_count(&rqst->rq_iter) > 0) {
+		struct iov_iter tmp_iter = rqst->rq_iter;
+		size_t maxsize = min(iov_iter_count(&tmp_iter), *remaining);
+		size_t did;
 
-	cifs_sg_set_buf(&sgtable, sig, SMB2_SIGNATURE_SIZE);
-	sg_mark_end(&sgtable.sgl[sgtable.nents - 1]);
-	*sgl = sgtable.sgl;
-	return p;
+		did = iterate_and_advance_kernel(&tmp_iter, maxsize, ctx, NULL,
+						 smb3_crypt_step);
+		if (did != maxsize)
+			return -EIO;
+		*remaining -= did;
+	}
+	return 0;
+}
+
+static int smb3_crypt_rqsts(struct smb_rqst *rqst, int num_rqst,
+			    unsigned int crypt_len, struct smb3_crypt_ctx *ctx)
+{
+	/*
+	 * Encrypt or decrypt the payload data.
+	 * Skip the transform header rqst[0].rq_iov[0].
+	 */
+	for (int i = 0; i < num_rqst; i++) {
+		int rc = smb3_crypt_rqst(&rqst[i], ctx, i == 0 ? 1 : 0,
+					 &crypt_len);
+
+		if (rc)
+			return rc;
+	}
+	if (crypt_len != 0)
+		/* Processed less data than expected. */
+		return -EOVERFLOW;
+	return 0;
 }
 
 static int
@@ -4468,22 +4465,22 @@ smb2_get_enc_key(struct TCP_Server_Info *server, __u64 ses_id, int enc, u8 *key)
  * On success return encrypted data in iov[1-N] and pages, leave iov[0]
  * untouched.
  */
-static int
-crypt_message(struct TCP_Server_Info *server, int num_rqst,
-	      struct smb_rqst *rqst, int enc, struct crypto_aead *tfm)
+static int crypt_message(struct TCP_Server_Info *server, int num_rqst,
+			 struct smb_rqst *rqst, int enc)
 {
 	struct smb2_transform_hdr *tr_hdr =
 		(struct smb2_transform_hdr *)rqst[0].rq_iov[0].iov_base;
+	__le16 cipher_type = server->cipher_type;
+	const u8 *assoc_data = (const u8 *)tr_hdr + 20;
 	unsigned int assoc_data_len = sizeof(struct smb2_transform_hdr) - 20;
 	int rc = 0;
-	struct scatterlist *sg;
-	u8 sign[SMB2_SIGNATURE_SIZE] = {};
 	u8 key[SMB3_ENC_DEC_KEY_SIZE];
-	struct aead_request *req;
-	u8 *iv;
-	DECLARE_CRYPTO_WAIT(wait);
+	union {
+		struct aes_gcm_key gcm;
+		struct aes_ccm_key ccm;
+	} crypt_key;
+	struct smb3_crypt_ctx ctx;
 	unsigned int crypt_len = le32_to_cpu(tr_hdr->OriginalMessageSize);
-	void *creq;
 
 	rc = smb2_get_enc_key(server, le64_to_cpu(tr_hdr->SessionId), enc, key);
 	if (rc) {
@@ -4492,54 +4489,62 @@ crypt_message(struct TCP_Server_Info *server, int num_rqst,
 		return rc;
 	}
 
-	if ((server->cipher_type == SMB2_ENCRYPTION_AES256_CCM) ||
-		(server->cipher_type == SMB2_ENCRYPTION_AES256_GCM))
-		rc = crypto_aead_setkey(tfm, key, SMB3_GCM256_CRYPTKEY_SIZE);
-	else
-		rc = crypto_aead_setkey(tfm, key, SMB3_GCM128_CRYPTKEY_SIZE);
+	ctx.cipher_type = cipher_type;
+	ctx.enc = enc;
 
-	if (rc) {
-		cifs_server_dbg(VFS, "%s: Failed to set aead key %d\n", __func__, rc);
-		return rc;
+	if (cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
+	    cipher_type == SMB2_ENCRYPTION_AES256_GCM) {
+		size_t key_size = (cipher_type == SMB2_ENCRYPTION_AES128_GCM) ?
+					  AES_KEYSIZE_128 :
+					  AES_KEYSIZE_256;
+
+		rc = aes_gcm_preparekey(&crypt_key.gcm, key, key_size,
+					SMB2_SIGNATURE_SIZE);
+		if (rc)
+			goto out;
+
+		aes_gcm_init(&ctx.gcm, tr_hdr->Nonce, &crypt_key.gcm);
+		aes_gcm_auth_update(&ctx.gcm, assoc_data, assoc_data_len);
+		rc = smb3_crypt_rqsts(rqst, num_rqst, crypt_len, &ctx);
+		if (rc)
+			goto out;
+		if (enc)
+			aes_gcm_encrypt_final(&ctx.gcm, tr_hdr->Signature);
+		else
+			rc = aes_gcm_decrypt_final(&ctx.gcm, tr_hdr->Signature);
+	} else if (cipher_type == SMB2_ENCRYPTION_AES128_CCM ||
+		   cipher_type == SMB2_ENCRYPTION_AES256_CCM) {
+		size_t key_size = (cipher_type == SMB2_ENCRYPTION_AES128_CCM) ?
+					  AES_KEYSIZE_128 :
+					  AES_KEYSIZE_256;
+
+		rc = aes_ccm_preparekey(&crypt_key.ccm, key, key_size,
+					SMB2_SIGNATURE_SIZE);
+		if (rc)
+			goto out;
+
+		rc = aes_ccm_init(&ctx.ccm, crypt_len, assoc_data_len,
+				  tr_hdr->Nonce, SMB3_AES_CCM_NONCE,
+				  &crypt_key.ccm);
+		if (rc)
+			goto out;
+		aes_ccm_auth_update(&ctx.ccm, assoc_data, assoc_data_len);
+		rc = smb3_crypt_rqsts(rqst, num_rqst, crypt_len, &ctx);
+		if (rc)
+			goto out;
+		if (enc)
+			aes_ccm_encrypt_final(&ctx.ccm, tr_hdr->Signature);
+		else
+			rc = aes_ccm_decrypt_final(&ctx.ccm, tr_hdr->Signature);
+	} else {
+		WARN_ON_ONCE(1);
+		rc = -EINVAL;
 	}
 
-	rc = crypto_aead_setauthsize(tfm, SMB2_SIGNATURE_SIZE);
-	if (rc) {
-		cifs_server_dbg(VFS, "%s: Failed to set authsize %d\n", __func__, rc);
-		return rc;
-	}
-
-	creq = smb2_get_aead_req(tfm, rqst, num_rqst, sign, &iv, &req, &sg);
-	if (IS_ERR(creq))
-		return PTR_ERR(creq);
-
-	if (!enc) {
-		memcpy(sign, &tr_hdr->Signature, SMB2_SIGNATURE_SIZE);
-		crypt_len += SMB2_SIGNATURE_SIZE;
-	}
-
-	if ((server->cipher_type == SMB2_ENCRYPTION_AES128_GCM) ||
-	    (server->cipher_type == SMB2_ENCRYPTION_AES256_GCM))
-		memcpy(iv, (char *)tr_hdr->Nonce, SMB3_AES_GCM_NONCE);
-	else {
-		iv[0] = 3;
-		memcpy(iv + 1, (char *)tr_hdr->Nonce, SMB3_AES_CCM_NONCE);
-	}
-
-	aead_request_set_tfm(req, tfm);
-	aead_request_set_crypt(req, sg, sg, crypt_len, iv);
-	aead_request_set_ad(req, assoc_data_len);
-
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
-				  crypto_req_done, &wait);
-
-	rc = crypto_wait_req(enc ? crypto_aead_encrypt(req)
-				: crypto_aead_decrypt(req), &wait);
-
-	if (!rc && enc)
-		memcpy(&tr_hdr->Signature, sign, SMB2_SIGNATURE_SIZE);
-
-	kfree_sensitive(creq);
+out:
+	memzero_explicit(&ctx, sizeof(ctx));
+	memzero_explicit(&crypt_key, sizeof(crypt_key));
+	memzero_explicit(key, sizeof(key));
 	return rc;
 }
 
@@ -4623,7 +4628,7 @@ smb3_init_transform_rq(struct TCP_Server_Info *server, int num_rqst,
 	/* fill the 1st iov with a transform header */
 	fill_transform_hdr(tr_hdr, orig_len, old_rq, server->cipher_type);
 
-	rc = crypt_message(server, num_rqst, new_rq, 1, server->secmech.enc);
+	rc = crypt_message(server, num_rqst, new_rq, 1);
 	cifs_dbg(FYI, "Encrypt message returned %d\n", rc);
 	if (rc)
 		goto err_free;
@@ -4648,7 +4653,6 @@ decrypt_raw_data(struct TCP_Server_Info *server, char *buf,
 		 unsigned int buf_data_size, struct iov_iter *iter,
 		 bool is_offloaded)
 {
-	struct crypto_aead *tfm;
 	struct smb_rqst rqst = {NULL};
 	struct kvec iov[2];
 	size_t iter_size = 0;
@@ -4666,30 +4670,8 @@ decrypt_raw_data(struct TCP_Server_Info *server, char *buf,
 		iter_size = iov_iter_count(iter);
 	}
 
-	if (is_offloaded) {
-		if ((server->cipher_type == SMB2_ENCRYPTION_AES128_GCM) ||
-		    (server->cipher_type == SMB2_ENCRYPTION_AES256_GCM))
-			tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
-		else
-			tfm = crypto_alloc_aead("ccm(aes)", 0, 0);
-		if (IS_ERR(tfm)) {
-			rc = PTR_ERR(tfm);
-			cifs_server_dbg(VFS, "%s: Failed alloc decrypt TFM, rc=%d\n", __func__, rc);
-
-			return rc;
-		}
-	} else {
-		rc = smb3_crypto_aead_allocate(server);
-		if (unlikely(rc))
-			return rc;
-		tfm = server->secmech.dec;
-	}
-
-	rc = crypt_message(server, 1, &rqst, 0, tfm);
+	rc = crypt_message(server, 1, &rqst, 0);
 	cifs_dbg(FYI, "Decrypt message returned %d\n", rc);
-
-	if (is_offloaded)
-		crypto_free_aead(tfm);
 
 	if (rc)
 		return rc;

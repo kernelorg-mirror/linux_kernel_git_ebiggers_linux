@@ -1730,8 +1730,6 @@ cifs_put_tcp_session(struct TCP_Server_Info *server, int from_reconnect)
 	server->tcpStatus = CifsExiting;
 	spin_unlock(&server->srv_lock);
 
-	cifs_crypto_secmech_release(server);
-
 	kfree_sensitive(server->session_key.response);
 	server->session_key.response = NULL;
 	server->session_key.len = 0;
@@ -1848,7 +1846,7 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx,
 #ifndef CONFIG_CIFS_SMB_DIRECT
 		cifs_dbg(VFS, "CONFIG_CIFS_SMB_DIRECT is not enabled\n");
 		rc = -ENOENT;
-		goto out_err_crypto_release;
+		goto out_err_put_net;
 #endif
 		tcp_ses->smbd_conn = smbd_get_connection(
 			tcp_ses, (struct sockaddr *)&ctx->dstaddr);
@@ -1858,13 +1856,13 @@ cifs_get_tcp_session(struct smb3_fs_context *ctx,
 			goto smbd_connected;
 		} else {
 			rc = -ENOENT;
-			goto out_err_crypto_release;
+			goto out_err_put_net;
 		}
 	}
 	rc = ip_connect(tcp_ses);
 	if (rc < 0) {
 		cifs_dbg(VFS, "Error connecting to socket. Aborting operation.\n");
-		goto out_err_crypto_release;
+		goto out_err_put_net;
 	}
 smbd_connected:
 	/*
@@ -1895,7 +1893,7 @@ smbd_connected:
 		rc = PTR_ERR(tcp_ses->tsk);
 		cifs_dbg(VFS, "error %d create cifsd thread\n", rc);
 		module_put(THIS_MODULE);
-		goto out_err_crypto_release;
+		goto out_err_put_net;
 	}
 	/* thread created, put it on the list */
 	spin_lock(&cifs_tcp_ses_lock);
@@ -1913,9 +1911,7 @@ smbd_connected:
 
 	return tcp_ses;
 
-out_err_crypto_release:
-	cifs_crypto_secmech_release(tcp_ses);
-
+out_err_put_net:
 	put_net(cifs_net_ns(tcp_ses));
 
 out_err:
