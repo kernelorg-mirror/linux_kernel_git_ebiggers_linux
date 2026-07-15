@@ -6,9 +6,8 @@
 #include <linux/scatterlist.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
-#include <crypto/aes.h>
+#include <crypto/aes-cbc.h>
 #include <crypto/krb5.h>
-#include <crypto/skcipher.h>
 #include <linux/key-type.h>
 #include <linux/sched/mm.h>
 
@@ -16,27 +15,6 @@
 #include <keys/user-type.h>
 #include <linux/ceph/decode.h>
 #include "crypto.h"
-
-static int set_aes_tfm(struct ceph_crypto_key *key)
-{
-	unsigned int noio_flag;
-	int ret;
-
-	noio_flag = memalloc_noio_save();
-	key->aes_tfm = crypto_alloc_sync_skcipher("cbc(aes)", 0, 0);
-	memalloc_noio_restore(noio_flag);
-	if (IS_ERR(key->aes_tfm)) {
-		ret = PTR_ERR(key->aes_tfm);
-		key->aes_tfm = NULL;
-		return ret;
-	}
-
-	ret = crypto_sync_skcipher_setkey(key->aes_tfm, key->key, key->len);
-	if (ret)
-		return ret;
-
-	return 0;
-}
 
 static int set_krb5_tfms(struct ceph_crypto_key *key, const u32 *key_usages,
 			 int key_usage_cnt)
@@ -82,7 +60,7 @@ int ceph_crypto_key_prepare(struct ceph_crypto_key *key,
 	case CEPH_CRYPTO_NONE:
 		return 0; /* nothing to do */
 	case CEPH_CRYPTO_AES:
-		return set_aes_tfm(key);
+		return aes_preparekey(&key->aes_key, key->key, key->len);
 	case CEPH_CRYPTO_AES256KRB5:
 		hmac_sha256_preparekey(&key->hmac_key, key->key, key->len);
 		return set_krb5_tfms(key, key_usages, key_usage_cnt);
@@ -174,10 +152,7 @@ void ceph_crypto_key_destroy(struct ceph_crypto_key *key)
 	key->key = NULL;
 
 	if (key->type == CEPH_CRYPTO_AES) {
-		if (key->aes_tfm) {
-			crypto_free_sync_skcipher(key->aes_tfm);
-			key->aes_tfm = NULL;
-		}
+		memzero_explicit(&key->aes_key, sizeof(key->aes_key));
 	} else if (key->type == CEPH_CRYPTO_AES256KRB5) {
 		memzero_explicit(&key->hmac_key, sizeof(key->hmac_key));
 		for (i = 0; i < ARRAY_SIZE(key->krb5_tfms); i++) {
@@ -264,26 +239,20 @@ static void teardown_sgtable(struct sg_table *sgt)
 static int ceph_aes_crypt(const struct ceph_crypto_key *key, bool encrypt,
 			  void *buf, int buf_len, int in_len, int *pout_len)
 {
-	SYNC_SKCIPHER_REQUEST_ON_STACK(req, key->aes_tfm);
-	struct sg_table sgt;
-	struct scatterlist prealloc_sg;
 	char iv[AES_BLOCK_SIZE] __aligned(8);
 	int pad_byte = AES_BLOCK_SIZE - (in_len & (AES_BLOCK_SIZE - 1));
 	int crypt_len = encrypt ? in_len + pad_byte : in_len;
-	int ret;
 
 	WARN_ON(crypt_len > buf_len);
+	if (crypt_len <= 0 || crypt_len % AES_BLOCK_SIZE != 0) {
+		pr_err("%s: got bad crypt_len %d for %scrypt\n", __func__,
+		       crypt_len, encrypt ? "en" : "de");
+		return -EINVAL;
+	}
 	if (encrypt)
 		memset(buf + in_len, pad_byte, pad_byte);
-	ret = setup_sgtable(&sgt, &prealloc_sg, buf, crypt_len);
-	if (ret)
-		return ret;
 
 	memcpy(iv, aes_iv, AES_BLOCK_SIZE);
-	skcipher_request_set_sync_tfm(req, key->aes_tfm);
-	skcipher_request_set_callback(req, 0, NULL, NULL);
-	skcipher_request_set_crypt(req, sgt.sgl, sgt.sgl, crypt_len, iv);
-
 	/*
 	print_hex_dump(KERN_ERR, "key: ", DUMP_PREFIX_NONE, 16, 1,
 		       key->key, key->len, 1);
@@ -291,15 +260,10 @@ static int ceph_aes_crypt(const struct ceph_crypto_key *key, bool encrypt,
 		       buf, crypt_len, 1);
 	*/
 	if (encrypt)
-		ret = crypto_skcipher_encrypt(req);
+		aes_cbc_encrypt(buf, buf, crypt_len, iv, &key->aes_key);
 	else
-		ret = crypto_skcipher_decrypt(req);
-	skcipher_request_zero(req);
-	if (ret) {
-		pr_err("%s %scrypt failed: %d\n", __func__,
-		       encrypt ? "en" : "de", ret);
-		goto out_sgt;
-	}
+		aes_cbc_decrypt(buf, buf, crypt_len, iv, &key->aes_key);
+
 	/*
 	print_hex_dump(KERN_ERR, "out: ", DUMP_PREFIX_NONE, 16, 1,
 		       buf, crypt_len, 1);
@@ -315,14 +279,10 @@ static int ceph_aes_crypt(const struct ceph_crypto_key *key, bool encrypt,
 		} else {
 			pr_err("%s got bad padding %d on in_len %d\n",
 			       __func__, pad_byte, in_len);
-			ret = -EPERM;
-			goto out_sgt;
+			return -EPERM;
 		}
 	}
-
-out_sgt:
-	teardown_sgtable(&sgt);
-	return ret;
+	return 0;
 }
 
 static int ceph_krb5_encrypt(const struct ceph_crypto_key *key, int usage_slot,

@@ -2,6 +2,7 @@
 #ifndef _FS_CEPH_CRYPTO_H
 #define _FS_CEPH_CRYPTO_H
 
+#include <crypto/aes.h>
 #include <crypto/sha2.h>
 #include <linux/ceph/types.h>
 #include <linux/ceph/buffer.h>
@@ -19,7 +20,7 @@ struct ceph_crypto_key {
 	void *key;
 
 	union {
-		struct crypto_sync_skcipher *aes_tfm;
+		struct aes_key aes_key;
 		struct {
 			struct hmac_sha256_key hmac_key;
 			const struct krb5_enctype *krb5_type;
