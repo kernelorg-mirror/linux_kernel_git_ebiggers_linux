@@ -25,11 +25,9 @@
 #include <linux/key-type.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
-#include <linux/scatterlist.h>
 #include <linux/ctype.h>
-#include <crypto/aes.h>
+#include <crypto/aes-cbc.h>
 #include <crypto/sha2.h>
-#include <crypto/skcipher.h>
 #include <crypto/utils.h>
 
 #include "encrypted.h"
@@ -37,17 +35,15 @@
 
 static const char KEY_TRUSTED_PREFIX[] = "trusted:";
 static const char KEY_USER_PREFIX[] = "user:";
-static const char blkcipher_alg[] = "cbc(aes)";
 static const char key_format_default[] = "default";
 static const char key_format_ecryptfs[] = "ecryptfs";
 static const char key_format_enc32[] = "enc32";
-static unsigned int ivsize;
-static int blksize;
 
 #define KEY_TRUSTED_PREFIX_LEN (sizeof (KEY_TRUSTED_PREFIX) - 1)
 #define KEY_USER_PREFIX_LEN (sizeof (KEY_USER_PREFIX) - 1)
 #define KEY_ECRYPTFS_DESC_LEN 16
 #define HASH_SIZE SHA256_DIGEST_SIZE
+#define IV_SIZE AES_BLOCK_SIZE /* AES-CBC initialization vector size in bytes */
 #define MAX_DATA_SIZE 4096
 #define MIN_DATA_SIZE  20
 #define KEY_ENC32_PAYLOAD_LEN 32
@@ -78,22 +74,6 @@ static bool user_decrypted_data = IS_ENABLED(CONFIG_USER_DECRYPTED_DATA);
 module_param(user_decrypted_data, bool, 0);
 MODULE_PARM_DESC(user_decrypted_data,
 	"Allow instantiation of encrypted keys using provided decrypted data");
-
-static int aes_get_sizes(void)
-{
-	struct crypto_skcipher *tfm;
-
-	tfm = crypto_alloc_skcipher(blkcipher_alg, 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm)) {
-		pr_err("encrypted_key: failed to alloc_cipher (%ld)\n",
-		       PTR_ERR(tfm));
-		return PTR_ERR(tfm);
-	}
-	ivsize = crypto_skcipher_ivsize(tfm);
-	blksize = crypto_skcipher_blocksize(tfm);
-	crypto_free_skcipher(tfm);
-	return 0;
-}
 
 /*
  * valid_ecryptfs_desc - verify the description of a new/loaded encrypted key
@@ -354,39 +334,6 @@ static int get_derived_key(u8 *derived_key, enum derived_key_type key_type,
 	return 0;
 }
 
-static struct skcipher_request *init_skcipher_req(const u8 *key,
-						  unsigned int key_len)
-{
-	struct skcipher_request *req;
-	struct crypto_skcipher *tfm;
-	int ret;
-
-	tfm = crypto_alloc_skcipher(blkcipher_alg, 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm)) {
-		pr_err("encrypted_key: failed to load %s transform (%ld)\n",
-		       blkcipher_alg, PTR_ERR(tfm));
-		return ERR_CAST(tfm);
-	}
-
-	ret = crypto_skcipher_setkey(tfm, key, key_len);
-	if (ret < 0) {
-		pr_err("encrypted_key: failed to setkey (%d)\n", ret);
-		crypto_free_skcipher(tfm);
-		return ERR_PTR(ret);
-	}
-
-	req = skcipher_request_alloc(tfm, GFP_KERNEL);
-	if (!req) {
-		pr_err("encrypted_key: failed to allocate request for %s\n",
-		       blkcipher_alg);
-		crypto_free_skcipher(tfm);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	skcipher_request_set_callback(req, 0, NULL, NULL);
-	return req;
-}
-
 static struct key *request_master_key(struct encrypted_key_payload *epayload,
 				      const u8 **master_key, size_t *master_keylen)
 {
@@ -427,42 +374,35 @@ static int derived_key_encrypt(struct encrypted_key_payload *epayload,
 			       const u8 *derived_key,
 			       unsigned int derived_keylen)
 {
-	struct scatterlist sg_in[2];
-	struct scatterlist sg_out[1];
-	struct crypto_skcipher *tfm;
-	struct skcipher_request *req;
+	struct aes_enckey key;
 	unsigned int encrypted_datalen;
-	u8 iv[AES_BLOCK_SIZE];
+	u8 iv[IV_SIZE];
 	int ret;
 
-	encrypted_datalen = roundup(epayload->decrypted_datalen, blksize);
+	ret = aes_prepareenckey(&key, derived_key, derived_keylen);
+	if (ret < 0) /* Should never fail here, since a valid length was used */
+		return ret;
 
-	req = init_skcipher_req(derived_key, derived_keylen);
-	ret = PTR_ERR(req);
-	if (IS_ERR(req))
-		goto out;
 	dump_decrypted_data(epayload);
 
-	sg_init_table(sg_in, 2);
-	sg_set_buf(&sg_in[0], epayload->decrypted_data,
-		   epayload->decrypted_datalen);
-	sg_set_page(&sg_in[1], ZERO_PAGE(0), AES_BLOCK_SIZE, 0);
-
-	sg_init_table(sg_out, 1);
-	sg_set_buf(sg_out, epayload->encrypted_data, encrypted_datalen);
-
+	/*
+	 * Pad the plaintext with zeros up to the next multiple of
+	 * AES_BLOCK_SIZE, to make it have a valid length for AES-CBC.
+	 * To do this without needing a temporary buffer, copy the plaintext
+	 * into ->encrypted_data, pad it, and encrypt it in-place.
+	 */
+	encrypted_datalen =
+		roundup(epayload->decrypted_datalen, AES_BLOCK_SIZE);
+	memset(epayload->encrypted_data, 0, encrypted_datalen);
+	memcpy(epayload->encrypted_data, epayload->decrypted_data,
+	       epayload->decrypted_datalen);
 	memcpy(iv, epayload->iv, sizeof(iv));
-	skcipher_request_set_crypt(req, sg_in, sg_out, encrypted_datalen, iv);
-	ret = crypto_skcipher_encrypt(req);
-	tfm = crypto_skcipher_reqtfm(req);
-	skcipher_request_free(req);
-	crypto_free_skcipher(tfm);
-	if (ret < 0)
-		pr_err("encrypted_key: failed to encrypt (%d)\n", ret);
-	else
-		dump_encrypted_data(epayload, encrypted_datalen);
-out:
-	return ret;
+	aes_cbc_encrypt(epayload->encrypted_data, epayload->encrypted_data,
+			encrypted_datalen, iv, &key);
+	dump_encrypted_data(epayload, encrypted_datalen);
+
+	memzero_explicit(&key, sizeof(key));
+	return 0;
 }
 
 static int datablob_hmac_append(struct encrypted_key_payload *epayload,
@@ -528,45 +468,37 @@ static int derived_key_decrypt(struct encrypted_key_payload *epayload,
 			       const u8 *derived_key,
 			       unsigned int derived_keylen)
 {
-	struct scatterlist sg_in[1];
-	struct scatterlist sg_out[2];
-	struct crypto_skcipher *tfm;
-	struct skcipher_request *req;
+	struct aes_key key;
 	unsigned int encrypted_datalen;
-	u8 iv[AES_BLOCK_SIZE];
-	u8 *pad;
+	u8 iv[IV_SIZE];
+	u8 *tmp;
 	int ret;
 
-	/* Throwaway buffer to hold the unused zero padding at the end */
-	pad = kmalloc(AES_BLOCK_SIZE, GFP_KERNEL);
-	if (!pad)
-		return -ENOMEM;
+	ret = aes_preparekey(&key, derived_key, derived_keylen);
+	if (ret < 0) /* Should never fail here, since a valid length was used */
+		return ret;
 
-	encrypted_datalen = roundup(epayload->decrypted_datalen, blksize);
-	req = init_skcipher_req(derived_key, derived_keylen);
-	ret = PTR_ERR(req);
-	if (IS_ERR(req))
+	/*
+	 * The plaintext was padded before encryption, so decrypt it into a
+	 * temporary buffer that has space for the padding.
+	 */
+	encrypted_datalen =
+		roundup(epayload->decrypted_datalen, AES_BLOCK_SIZE);
+	tmp = kmalloc(encrypted_datalen, GFP_KERNEL);
+	if (!tmp) {
+		ret = -ENOMEM;
 		goto out;
+	}
 	dump_encrypted_data(epayload, encrypted_datalen);
-
-	sg_init_table(sg_in, 1);
-	sg_init_table(sg_out, 2);
-	sg_set_buf(sg_in, epayload->encrypted_data, encrypted_datalen);
-	sg_set_buf(&sg_out[0], epayload->decrypted_data,
-		   epayload->decrypted_datalen);
-	sg_set_buf(&sg_out[1], pad, AES_BLOCK_SIZE);
-
 	memcpy(iv, epayload->iv, sizeof(iv));
-	skcipher_request_set_crypt(req, sg_in, sg_out, encrypted_datalen, iv);
-	ret = crypto_skcipher_decrypt(req);
-	tfm = crypto_skcipher_reqtfm(req);
-	skcipher_request_free(req);
-	crypto_free_skcipher(tfm);
-	if (ret < 0)
-		goto out;
+	aes_cbc_decrypt(tmp, epayload->encrypted_data, encrypted_datalen, iv,
+			&key);
+	memcpy(epayload->decrypted_data, tmp, epayload->decrypted_datalen);
 	dump_decrypted_data(epayload);
+	ret = 0;
 out:
-	kfree(pad);
+	kfree_sensitive(tmp);
+	memzero_explicit(&key, sizeof(key));
 	return ret;
 }
 
@@ -630,10 +562,10 @@ static struct encrypted_key_payload *encrypted_key_alloc(struct key *key,
 		}
 	}
 
-	encrypted_datalen = roundup(decrypted_datalen, blksize);
+	encrypted_datalen = roundup(decrypted_datalen, AES_BLOCK_SIZE);
 
-	datablob_len = format_len + 1 + strlen(master_desc) + 1
-	    + strlen(datalen) + 1 + ivsize + 1 + encrypted_datalen;
+	datablob_len = format_len + 1 + strlen(master_desc) + 1 +
+		       strlen(datalen) + 1 + IV_SIZE + 1 + encrypted_datalen;
 
 	ret = key_payload_reserve(key, payload_datalen + datablob_len
 				  + HASH_SIZE + 1);
@@ -664,13 +596,14 @@ static int encrypted_key_decrypt(struct encrypted_key_payload *epayload,
 	size_t asciilen;
 	int ret;
 
-	encrypted_datalen = roundup(epayload->decrypted_datalen, blksize);
-	asciilen = (ivsize + 1 + encrypted_datalen + HASH_SIZE) * 2;
+	encrypted_datalen =
+		roundup(epayload->decrypted_datalen, AES_BLOCK_SIZE);
+	asciilen = (IV_SIZE + 1 + encrypted_datalen + HASH_SIZE) * 2;
 	if (strlen(hex_encoded_iv) != asciilen)
 		return -EINVAL;
 
-	hex_encoded_data = hex_encoded_iv + (2 * ivsize) + 2;
-	ret = hex2bin(epayload->iv, hex_encoded_iv, ivsize);
+	hex_encoded_data = hex_encoded_iv + (2 * IV_SIZE) + 2;
+	ret = hex2bin(epayload->iv, hex_encoded_iv, IV_SIZE);
 	if (ret < 0)
 		return -EINVAL;
 	ret = hex2bin(epayload->encrypted_data, hex_encoded_data,
@@ -719,7 +652,7 @@ static void __ekey_init(struct encrypted_key_payload *epayload,
 	epayload->master_desc = epayload->format + format_len + 1;
 	epayload->datalen = epayload->master_desc + strlen(master_desc) + 1;
 	epayload->iv = epayload->datalen + strlen(datalen) + 1;
-	epayload->encrypted_data = epayload->iv + ivsize + 1;
+	epayload->encrypted_data = epayload->iv + IV_SIZE + 1;
 	epayload->decrypted_data = epayload->payload_data;
 
 	if (!format)
@@ -763,11 +696,11 @@ static int encrypted_init(struct encrypted_key_payload *epayload,
 	if (hex_encoded_iv) {
 		ret = encrypted_key_decrypt(epayload, format, hex_encoded_iv);
 	} else if (decrypted_data) {
-		get_random_bytes(epayload->iv, ivsize);
+		get_random_bytes(epayload->iv, IV_SIZE);
 		ret = hex2bin(epayload->decrypted_data, decrypted_data,
 			      epayload->decrypted_datalen);
 	} else {
-		get_random_bytes(epayload->iv, ivsize);
+		get_random_bytes(epayload->iv, IV_SIZE);
 		get_random_bytes(epayload->decrypted_data, epayload->decrypted_datalen);
 	}
 	return ret;
@@ -884,7 +817,7 @@ static int encrypted_update(struct key *key, struct key_preparsed_payload *prep)
 	__ekey_init(new_epayload, epayload->format, new_master_desc,
 		    epayload->datalen);
 
-	memcpy(new_epayload->iv, epayload->iv, ivsize);
+	memcpy(new_epayload->iv, epayload->iv, IV_SIZE);
 	memcpy(new_epayload->payload_data, epayload->payload_data,
 	       epayload->payload_datalen);
 
@@ -918,9 +851,9 @@ static long encrypted_read(const struct key *key, char *buffer,
 	epayload = dereference_key_locked(key);
 
 	/* returns the hex encoded iv, encrypted-data, and hmac as ascii */
-	asciiblob_len = epayload->datablob_len + ivsize + 1
-	    + roundup(epayload->decrypted_datalen, blksize)
-	    + (HASH_SIZE * 2);
+	asciiblob_len = epayload->datablob_len + IV_SIZE + 1 +
+			roundup(epayload->decrypted_datalen, AES_BLOCK_SIZE) +
+			(HASH_SIZE * 2);
 
 	if (!buffer || buflen < asciiblob_len)
 		return asciiblob_len;
@@ -982,11 +915,6 @@ EXPORT_SYMBOL_GPL(key_type_encrypted);
 
 static int __init init_encrypted(void)
 {
-	int ret;
-
-	ret = aes_get_sizes();
-	if (ret < 0)
-		return ret;
 	return register_key_type(&key_type_encrypted);
 }
 

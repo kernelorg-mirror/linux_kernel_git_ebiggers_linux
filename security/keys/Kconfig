@@ -83,9 +83,7 @@ endif
 
 config ENCRYPTED_KEYS
 	tristate "ENCRYPTED KEYS"
-	select CRYPTO
-	select CRYPTO_AES
-	select CRYPTO_CBC
+	select CRYPTO_LIB_AES_CBC
 	select CRYPTO_LIB_SHA256
 	help
 	  This option provides support for create/encrypting/decrypting keys
