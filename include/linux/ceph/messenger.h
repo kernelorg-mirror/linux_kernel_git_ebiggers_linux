@@ -2,9 +2,9 @@
 #ifndef __FS_CEPH_MESSENGER_H
 #define __FS_CEPH_MESSENGER_H
 
+#include <crypto/aes-gcm.h>
 #include <crypto/sha2.h>
 #include <linux/bvec.h>
-#include <linux/crypto.h>
 #include <linux/kref.h>
 #include <linux/mutex.h>
 #include <linux/net.h>
@@ -401,8 +401,7 @@ struct ceph_connection_v2_info {
 
 	struct iov_iter out_iter;
 	struct kvec out_kvecs[8];  /* sendmsg */
-	struct bio_vec out_bvec;  /* sendpage (out_cursor, out_zero),
-				     sendmsg (out_enc_pages) */
+	struct bio_vec out_bvec; /* sendpage (out_cursor, out_zero) */
 	int out_kvec_cnt;
 	int out_state;  /* OUT_S_* */
 
@@ -415,20 +414,15 @@ struct ceph_connection_v2_info {
 
 	struct hmac_sha256_key hmac_key;  /* post-auth signature */
 	bool hmac_key_set;
-	struct crypto_aead *gcm_tfm;  /* on-wire encryption */
-	struct aead_request *gcm_req;
-	struct crypto_wait gcm_wait;
+	struct aes_gcm_key gcm_key; /* on-wire encryption */
+	bool gcm_key_set;
 	struct ceph_gcm_nonce in_gcm_nonce;
 	struct ceph_gcm_nonce out_gcm_nonce;
 
-	struct page **in_enc_pages;
-	int in_enc_page_cnt;
-	int in_enc_resid;
-	int in_enc_i;
-	struct page **out_enc_pages;
-	int out_enc_page_cnt;
-	int out_enc_resid;
-	int out_enc_i;
+	struct aes_gcm_ctx in_gcm_ctx;
+	struct aes_gcm_ctx out_gcm_ctx;
+	u8 *out_ciphertext;
+	u8 *out_front_middle_ciphertext;
 
 	int con_mode;  /* CEPH_CON_MODE_* */
 
