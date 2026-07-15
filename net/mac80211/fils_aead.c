@@ -5,7 +5,7 @@
  */
 
 #include <crypto/aes-cbc-macs.h>
-#include <crypto/skcipher.h>
+#include <crypto/aes-ctr.h>
 #include <crypto/utils.h>
 
 #include "ieee80211_i.h"
@@ -73,11 +73,8 @@ static int aes_siv_encrypt(const u8 *key, size_t key_len,
 			   size_t len[], u8 *out)
 {
 	u8 v[AES_BLOCK_SIZE];
-	struct crypto_skcipher *tfm2;
-	struct skcipher_request *req;
+	struct aes_enckey aes_key;
 	int res;
-	struct scatterlist src[1], dst[1];
-	u8 *tmp;
 
 	key_len /= 2; /* S2V key || CTR key */
 
@@ -90,12 +87,12 @@ static int aes_siv_encrypt(const u8 *key, size_t key_len,
 	if (res)
 		return res;
 
-	/* Use a temporary buffer of the plaintext to handle need for
-	 * overwriting this during AES-CTR.
+	/*
+	 * Move the plaintext to prepare it for in-place encryption.  This
+	 * avoids needing to copy it into a temporary buffer to prevent it from
+	 * being clobbered by the IV copy or AES-CTR itself when out == plain.
 	 */
-	tmp = kmemdup(plain, plain_len, GFP_KERNEL);
-	if (!tmp)
-		return -ENOMEM;
+	memmove(out + AES_BLOCK_SIZE, plain, plain_len);
 
 	/* IV for CTR before encrypted data */
 	memcpy(out, v, AES_BLOCK_SIZE);
@@ -106,33 +103,14 @@ static int aes_siv_encrypt(const u8 *key, size_t key_len,
 	v[8] &= 0x7f;
 	v[12] &= 0x7f;
 
-	/* CTR */
-
-	tfm2 = crypto_alloc_skcipher("ctr(aes)", 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm2)) {
-		kfree(tmp);
-		return PTR_ERR(tfm2);
-	}
-	/* K2 for CTR */
-	res = crypto_skcipher_setkey(tfm2, key + key_len, key_len);
+	/* CTR with K2 */
+	res = aes_prepareenckey(&aes_key, key + key_len, key_len);
 	if (res)
-		goto fail;
-
-	req = skcipher_request_alloc(tfm2, GFP_KERNEL);
-	if (!req) {
-		res = -ENOMEM;
-		goto fail;
-	}
-
-	sg_init_one(src, tmp, plain_len);
-	sg_init_one(dst, out + AES_BLOCK_SIZE, plain_len);
-	skcipher_request_set_crypt(req, src, dst, plain_len, v);
-	res = crypto_skcipher_encrypt(req);
-	skcipher_request_free(req);
-fail:
-	kfree(tmp);
-	crypto_free_skcipher(tfm2);
-	return res;
+		return res;
+	aes_ctr(out + AES_BLOCK_SIZE, out + AES_BLOCK_SIZE, plain_len, v,
+		&aes_key);
+	memzero_explicit(&aes_key, sizeof(aes_key));
+	return 0;
 }
 
 /* Note: addr[] and len[] needs to have one extra slot at the end. */
@@ -141,9 +119,7 @@ static int aes_siv_decrypt(const u8 *key, size_t key_len,
 			   size_t num_elem, const u8 *addr[], size_t len[],
 			   u8 *out)
 {
-	struct crypto_skcipher *tfm2;
-	struct skcipher_request *req;
-	struct scatterlist src[1], dst[1];
+	struct aes_enckey aes_key;
 	size_t crypt_len;
 	int res;
 	u8 frame_iv[AES_BLOCK_SIZE], iv[AES_BLOCK_SIZE];
@@ -164,38 +140,24 @@ static int aes_siv_decrypt(const u8 *key, size_t key_len,
 	iv[8] &= 0x7f;
 	iv[12] &= 0x7f;
 
-	/* CTR */
-
-	tfm2 = crypto_alloc_skcipher("ctr(aes)", 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(tfm2))
-		return PTR_ERR(tfm2);
-	/* K2 for CTR */
-	res = crypto_skcipher_setkey(tfm2, key + key_len, key_len);
-	if (res) {
-		crypto_free_skcipher(tfm2);
-		return res;
-	}
-
-	req = skcipher_request_alloc(tfm2, GFP_KERNEL);
-	if (!req) {
-		crypto_free_skcipher(tfm2);
-		return -ENOMEM;
-	}
-
-	sg_init_one(src, iv_crypt + AES_BLOCK_SIZE, crypt_len);
-	sg_init_one(dst, out, crypt_len);
-	skcipher_request_set_crypt(req, src, dst, crypt_len, iv);
-	res = crypto_skcipher_decrypt(req);
-	skcipher_request_free(req);
-	crypto_free_skcipher(tfm2);
+	/* CTR with K2 */
+	res = aes_prepareenckey(&aes_key, key + key_len, key_len);
 	if (res)
 		return res;
+	/*
+	 * aes_ctr(out, iv_crypt + AES_BLOCK_SIZE, ...) is an unsupported
+	 * overlapped operation when out == iv_crypt, so memmove() the data to
+	 * 'out' first to enable standard in-place operation.
+	 */
+	memmove(out, iv_crypt + AES_BLOCK_SIZE, crypt_len);
+	aes_ctr(out, out, crypt_len, iv, &aes_key);
+	memzero_explicit(&aes_key, sizeof(aes_key));
 
 	/* S2V */
 	res = aes_s2v(key /* K1 */, key_len, num_elem, addr, len, check);
 	if (res)
 		return res;
-	if (memcmp(check, frame_iv, AES_BLOCK_SIZE) != 0)
+	if (crypto_memneq(check, frame_iv, AES_BLOCK_SIZE))
 		return -EINVAL;
 	return 0;
 }
