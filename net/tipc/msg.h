@@ -138,9 +138,6 @@ struct tipc_skb_cb {
 		u8 flags;
 	};
 	u8 reserved;
-#ifdef CONFIG_TIPC_CRYPTO
-	void *crypto_ctx;
-#endif
 } __packed;
 
 #define TIPC_SKB_CB(__skb) ((struct tipc_skb_cb *)&((__skb)->cb[0]))

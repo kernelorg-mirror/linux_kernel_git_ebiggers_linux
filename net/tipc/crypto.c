@@ -34,8 +34,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <crypto/aead.h>
-#include <crypto/aes.h>
+#include <crypto/aes-gcm.h>
 #include <crypto/rng.h>
 #include "crypto.h"
 #include "msg.h"
@@ -69,9 +68,9 @@ enum {
 enum {
 	STAT_OK,
 	STAT_NOK,
-	STAT_ASYNC,
-	STAT_ASYNC_OK,
-	STAT_ASYNC_NOK,
+	STAT_ASYNC, /* no longer used */
+	STAT_ASYNC_OK, /* no longer used */
+	STAT_ASYNC_NOK, /* no longer used */
 	STAT_BADKEYS, /* tx only */
 	STAT_BADMSGS = STAT_BADKEYS, /* rx only */
 	STAT_NOKEYS,
@@ -122,18 +121,8 @@ struct tipc_key {
 };
 
 /**
- * struct tipc_tfm - TIPC TFM structure to form a list of TFMs
- * @tfm: cipher handle/key
- * @list: linked list of TFMs
- */
-struct tipc_tfm {
-	struct crypto_aead *tfm;
-	struct list_head list;
-};
-
-/**
  * struct tipc_aead - TIPC AEAD key structure
- * @tfm_entry: per-cpu pointer to one entry in TFM list
+ * @gcm_key: the AES-GCM key
  * @crypto: TIPC crypto owns this key
  * @cloned: reference to the source key in case cloning
  * @users: the number of the key users (TX/RX)
@@ -149,7 +138,7 @@ struct tipc_tfm {
  */
 struct tipc_aead {
 #define TIPC_AEAD_HINT_LEN (5)
-	struct tipc_tfm * __percpu *tfm_entry;
+	struct aes_gcm_key gcm_key;
 	struct tipc_crypto *crypto;
 	struct tipc_aead *cloned;
 	atomic_t users;
@@ -235,19 +224,6 @@ struct tipc_crypto {
 
 } ____cacheline_aligned;
 
-/* struct tipc_crypto_tx_ctx - TX context for callbacks */
-struct tipc_crypto_tx_ctx {
-	struct tipc_aead *aead;
-	struct tipc_bearer *bearer;
-	struct tipc_media_addr dst;
-};
-
-/* struct tipc_crypto_rx_ctx - RX context for callbacks */
-struct tipc_crypto_rx_ctx {
-	struct tipc_aead *aead;
-	struct tipc_bearer *bearer;
-};
-
 static struct tipc_aead *tipc_aead_get(struct tipc_aead __rcu *aead);
 static inline void tipc_aead_put(struct tipc_aead *aead);
 static void tipc_aead_free(struct rcu_head *rp);
@@ -255,22 +231,15 @@ static int tipc_aead_users(struct tipc_aead __rcu *aead);
 static void tipc_aead_users_inc(struct tipc_aead __rcu *aead, int lim);
 static void tipc_aead_users_dec(struct tipc_aead __rcu *aead, int lim);
 static void tipc_aead_users_set(struct tipc_aead __rcu *aead, int val);
-static struct crypto_aead *tipc_aead_tfm_next(struct tipc_aead *aead);
 static int tipc_aead_init(struct tipc_aead **aead, struct tipc_aead_key *ukey,
 			  u8 mode);
 static int tipc_aead_clone(struct tipc_aead **dst, struct tipc_aead *src);
-static void *tipc_aead_mem_alloc(struct crypto_aead *tfm,
-				 unsigned int crypto_ctx_size,
-				 u8 **iv, struct aead_request **req,
-				 struct scatterlist **sg, int nsg);
 static int tipc_aead_encrypt(struct tipc_aead *aead, struct sk_buff *skb,
 			     struct tipc_bearer *b,
 			     struct tipc_media_addr *dst,
 			     struct tipc_node *__dnode);
-static void tipc_aead_encrypt_done(void *data, int err);
 static int tipc_aead_decrypt(struct net *net, struct tipc_aead *aead,
 			     struct sk_buff *skb, struct tipc_bearer *b);
-static void tipc_aead_decrypt_done(void *data, int err);
 static inline int tipc_ehdr_size(struct tipc_ehdr *ehdr);
 static int tipc_ehdr_build(struct net *net, struct tipc_aead *aead,
 			   u8 tx_key, struct sk_buff *skb,
@@ -335,12 +304,6 @@ int tipc_aead_key_validate(struct tipc_aead_key *ukey, struct genl_info *info)
 {
 	int keylen;
 
-	/* Check if algorithm exists */
-	if (unlikely(!crypto_has_alg(ukey->alg_name, 0, 0))) {
-		GENL_SET_ERR_MSG(info, "unable to load the algorithm (module existed?)");
-		return -ENODEV;
-	}
-
 	/* Currently, we only support the "gcm(aes)" cipher algorithm */
 	if (strcmp(ukey->alg_name, "gcm(aes)")) {
 		GENL_SET_ERR_MSG(info, "not supported yet the algorithm");
@@ -391,30 +354,15 @@ static inline void tipc_aead_put(struct tipc_aead *aead)
 }
 
 /**
- * tipc_aead_free - Release AEAD key incl. all the TFMs in the list
+ * tipc_aead_free - Release AEAD key
  * @rp: rcu head pointer
  */
 static void tipc_aead_free(struct rcu_head *rp)
 {
 	struct tipc_aead *aead = container_of(rp, struct tipc_aead, rcu);
-	struct tipc_tfm *tfm_entry, *head, *tmp;
 
-	if (aead->cloned) {
+	if (aead->cloned)
 		tipc_aead_put(aead->cloned);
-	} else {
-		head = *get_cpu_ptr(aead->tfm_entry);
-		put_cpu_ptr(aead->tfm_entry);
-		list_for_each_entry_safe(tfm_entry, tmp, &head->list, list) {
-			crypto_free_aead(tfm_entry->tfm);
-			list_del(&tfm_entry->list);
-			kfree(tfm_entry);
-		}
-		/* Free the head */
-		crypto_free_aead(head->tfm);
-		list_del(&head->list);
-		kfree(head);
-	}
-	free_percpu(aead->tfm_entry);
 	kfree_sensitive(aead->key);
 	kfree_sensitive(aead);
 }
@@ -473,43 +421,20 @@ static void tipc_aead_users_set(struct tipc_aead __rcu *aead, int val)
 }
 
 /**
- * tipc_aead_tfm_next - Move TFM entry to the next one in list and return it
- * @aead: the AEAD key pointer
- */
-static struct crypto_aead *tipc_aead_tfm_next(struct tipc_aead *aead)
-{
-	struct tipc_tfm **tfm_entry;
-	struct crypto_aead *tfm;
-
-	tfm_entry = get_cpu_ptr(aead->tfm_entry);
-	*tfm_entry = list_next_entry(*tfm_entry, list);
-	tfm = (*tfm_entry)->tfm;
-	put_cpu_ptr(tfm_entry);
-
-	return tfm;
-}
-
-/**
  * tipc_aead_init - Initiate TIPC AEAD
  * @aead: returned new TIPC AEAD key handle pointer
  * @ukey: pointer to user key data
  * @mode: the key mode
  *
- * Allocate a (list of) new cipher transformation (TFM) with the specific user
- * key data if valid. The number of the allocated TFMs can be set via the sysfs
- * "net/tipc/max_tfms" first.
- * Also, all the other AEAD data are also initialized.
+ * Allocate a new AEAD key container and prepare the AES-GCM key.
  *
  * Return: 0 if the initiation is successful, otherwise: < 0
  */
 static int tipc_aead_init(struct tipc_aead **aead, struct tipc_aead_key *ukey,
 			  u8 mode)
 {
-	struct tipc_tfm *tfm_entry, *head;
-	struct crypto_aead *tfm;
 	struct tipc_aead *tmp;
-	int keylen, err, cpu;
-	int tfm_cnt = 0;
+	int keylen, err;
 
 	if (unlikely(*aead))
 		return -EEXIST;
@@ -522,59 +447,9 @@ static int tipc_aead_init(struct tipc_aead **aead, struct tipc_aead_key *ukey,
 	/* The key consists of two parts: [AES-KEY][SALT] */
 	keylen = ukey->keylen - TIPC_AES_GCM_SALT_SIZE;
 
-	/* Allocate per-cpu TFM entry pointer */
-	tmp->tfm_entry = alloc_percpu(struct tipc_tfm *);
-	if (!tmp->tfm_entry) {
-		kfree_sensitive(tmp);
-		return -ENOMEM;
-	}
-
-	/* Make a list of TFMs with the user key data */
-	do {
-		tfm = crypto_alloc_aead(ukey->alg_name, 0, 0);
-		if (IS_ERR(tfm)) {
-			err = PTR_ERR(tfm);
-			break;
-		}
-
-		if (unlikely(!tfm_cnt &&
-			     crypto_aead_ivsize(tfm) != TIPC_AES_GCM_IV_SIZE)) {
-			crypto_free_aead(tfm);
-			err = -ENOTSUPP;
-			break;
-		}
-
-		err = crypto_aead_setauthsize(tfm, TIPC_AES_GCM_TAG_SIZE);
-		err |= crypto_aead_setkey(tfm, ukey->key, keylen);
-		if (unlikely(err)) {
-			crypto_free_aead(tfm);
-			break;
-		}
-
-		tfm_entry = kmalloc_obj(*tfm_entry);
-		if (unlikely(!tfm_entry)) {
-			crypto_free_aead(tfm);
-			err = -ENOMEM;
-			break;
-		}
-		INIT_LIST_HEAD(&tfm_entry->list);
-		tfm_entry->tfm = tfm;
-
-		/* First entry? */
-		if (!tfm_cnt) {
-			head = tfm_entry;
-			for_each_possible_cpu(cpu) {
-				*per_cpu_ptr(tmp->tfm_entry, cpu) = head;
-			}
-		} else {
-			list_add_tail(&tfm_entry->list, &head->list);
-		}
-
-	} while (++tfm_cnt < sysctl_tipc_max_tfms);
-
-	/* Not any TFM is allocated? */
-	if (!tfm_cnt) {
-		free_percpu(tmp->tfm_entry);
+	err = aes_gcm_preparekey(&tmp->gcm_key, ukey->key, keylen,
+				 TIPC_AES_GCM_TAG_SIZE);
+	if (unlikely(err)) {
 		kfree_sensitive(tmp);
 		return err;
 	}
@@ -606,10 +481,8 @@ static int tipc_aead_init(struct tipc_aead **aead, struct tipc_aead_key *ukey,
  * @dst: dest key for the cloning
  * @src: source key to clone from
  *
- * Make a "copy" of the source AEAD key data to the dest, the TFMs list is
- * common for the keys.
- * A reference to the source is hold in the "cloned" pointer for the later
- * freeing purposes.
+ * Make a "copy" of the source AEAD key data to the dest. A reference to the
+ * source is held in the "cloned" pointer for later freeing purposes.
  *
  * Note: this must be done in cluster-key mode only!
  * Return: 0 in case of success, otherwise < 0
@@ -617,7 +490,6 @@ static int tipc_aead_init(struct tipc_aead **aead, struct tipc_aead_key *ukey,
 static int tipc_aead_clone(struct tipc_aead **dst, struct tipc_aead *src)
 {
 	struct tipc_aead *aead;
-	int cpu;
 
 	if (!src)
 		return -ENOKEY;
@@ -632,16 +504,7 @@ static int tipc_aead_clone(struct tipc_aead **dst, struct tipc_aead *src)
 	if (unlikely(!aead))
 		return -ENOMEM;
 
-	aead->tfm_entry = alloc_percpu_gfp(struct tipc_tfm *, GFP_ATOMIC);
-	if (unlikely(!aead->tfm_entry)) {
-		kfree_sensitive(aead);
-		return -ENOMEM;
-	}
-
-	for_each_possible_cpu(cpu) {
-		*per_cpu_ptr(aead->tfm_entry, cpu) =
-				*per_cpu_ptr(src->tfm_entry, cpu);
-	}
+	aead->gcm_key = src->gcm_key;
 
 	memcpy(aead->hint, src->hint, sizeof(src->hint));
 	aead->mode = src->mode;
@@ -658,53 +521,54 @@ static int tipc_aead_clone(struct tipc_aead **dst, struct tipc_aead *src)
 	return 0;
 }
 
-/**
- * tipc_aead_mem_alloc - Allocate memory for AEAD request operations
- * @tfm: cipher handle to be registered with the request
- * @crypto_ctx_size: size of crypto context for callback
- * @iv: returned pointer to IV data
- * @req: returned pointer to AEAD request data
- * @sg: returned pointer to SG lists
- * @nsg: number of SG lists to be allocated
- *
- * Allocate memory to store the crypto context data, AEAD request, IV and SG
- * lists, the memory layout is as follows:
- * crypto_ctx || iv || aead_req || sg[]
- *
- * Return: the pointer to the memory areas in case of success, otherwise NULL
- */
-static void *tipc_aead_mem_alloc(struct crypto_aead *tfm,
-				 unsigned int crypto_ctx_size,
-				 u8 **iv, struct aead_request **req,
-				 struct scatterlist **sg, int nsg)
+static void tipc_decrypt_chunk(struct aes_gcm_ctx *ctx, u8 *data, size_t avail,
+			       size_t *assoc_len, size_t *crypt_len)
 {
-	unsigned int iv_size, req_size;
-	unsigned int len;
-	u8 *mem;
+	size_t n;
 
-	iv_size = crypto_aead_ivsize(tfm);
-	req_size = sizeof(**req) + crypto_aead_reqsize(tfm);
+	if (*assoc_len && avail) {
+		/* Associated data */
+		n = min(avail, *assoc_len);
+		aes_gcm_auth_update(ctx, data, n);
+		data += n;
+		avail -= n;
+		*assoc_len -= n;
+	}
 
-	len = crypto_ctx_size;
-	len += iv_size;
-	len += crypto_aead_alignmask(tfm) & ~(crypto_tfm_ctx_alignment() - 1);
-	len = ALIGN(len, crypto_tfm_ctx_alignment());
-	len += req_size;
-	len = ALIGN(len, __alignof__(struct scatterlist));
-	len += nsg * sizeof(**sg);
+	if (*crypt_len && avail) {
+		/* En/decrypted data */
+		n = min(avail, *crypt_len);
+		aes_gcm_decrypt_update(ctx, data, data, n);
+		*crypt_len -= n;
+	}
+}
 
-	mem = kmalloc(len, GFP_ATOMIC);
-	if (!mem)
-		return NULL;
+/**
+ * tipc_decrypt_skb() - Decrypt an skb in-place using AES-GCM
+ * @ctx: An AES-GCM context
+ * @skb: The socket buffer to process
+ * @assoc_len: Length of associated data
+ * @crypt_len: Length of payload data to encrypt or decrypt
+ *
+ * Updates the given AES-GCM context with @assoc_len bytes of associated data
+ * from the skb, then decrypts @crypt_len bytes in-place.  Context
+ * initialization and finalization are handled by the caller.
+ *
+ * The data (both associated and en/decrypted) is taken from the linear head and
+ * frag_list.  It is assumed that the @skb was processed by skb_cow_data(),
+ * meaning it has no page fragments (nr_frags == 0) and is writable.
+ */
+static void tipc_decrypt_skb(struct aes_gcm_ctx *ctx, struct sk_buff *skb,
+			     size_t assoc_len, size_t crypt_len)
+{
+	struct sk_buff *frag_iter;
 
-	*iv = (u8 *)PTR_ALIGN(mem + crypto_ctx_size,
-			      crypto_aead_alignmask(tfm) + 1);
-	*req = (struct aead_request *)PTR_ALIGN(*iv + iv_size,
-						crypto_tfm_ctx_alignment());
-	*sg = (struct scatterlist *)PTR_ALIGN((u8 *)*req + req_size,
-					      __alignof__(struct scatterlist));
-
-	return (void *)mem;
+	WARN_ON_ONCE(skb_shinfo(skb)->nr_frags);
+	tipc_decrypt_chunk(ctx, skb->data, skb_headlen(skb), &assoc_len,
+			   &crypt_len);
+	skb_walk_frags(skb, frag_iter)
+		tipc_decrypt_chunk(ctx, frag_iter->data, frag_iter->len,
+				   &assoc_len, &crypt_len);
 }
 
 /**
@@ -717,7 +581,6 @@ static void *tipc_aead_mem_alloc(struct crypto_aead *tfm,
  *
  * Return:
  * * 0                   : if the encryption has completed
- * * -EINPROGRESS/-EBUSY : if a callback will be performed
  * * < 0                 : the encryption has failed
  */
 static int tipc_aead_encrypt(struct tipc_aead *aead, struct sk_buff *skb,
@@ -725,16 +588,11 @@ static int tipc_aead_encrypt(struct tipc_aead *aead, struct sk_buff *skb,
 			     struct tipc_media_addr *dst,
 			     struct tipc_node *__dnode)
 {
-	struct crypto_aead *tfm = tipc_aead_tfm_next(aead);
-	struct tipc_crypto_tx_ctx *tx_ctx;
-	struct aead_request *req;
 	struct sk_buff *trailer;
-	struct scatterlist *sg;
 	struct tipc_ehdr *ehdr;
-	int ehsz, len, tailen, nsg, rc;
-	void *ctx;
+	int ehsz, len, tailen, nsg;
 	u32 salt;
-	u8 *iv;
+	u8 iv[TIPC_AES_GCM_IV_SIZE];
 
 	/* Make sure message len at least 4-byte aligned */
 	len = ALIGN(skb->len, 4);
@@ -760,20 +618,6 @@ static int tipc_aead_encrypt(struct tipc_aead *aead, struct sk_buff *skb,
 
 	pskb_put(skb, trailer, tailen);
 
-	/* Allocate memory for the AEAD operation */
-	ctx = tipc_aead_mem_alloc(tfm, sizeof(*tx_ctx), &iv, &req, &sg, nsg);
-	if (unlikely(!ctx))
-		return -ENOMEM;
-	TIPC_SKB_CB(skb)->crypto_ctx = ctx;
-
-	/* Map skb to the sg lists */
-	sg_init_table(sg, nsg);
-	rc = skb_to_sgvec(skb, sg, 0, skb->len);
-	if (unlikely(rc < 0)) {
-		pr_err("TX: skb_to_sgvec() returned %d, nsg %d!\n", rc, nsg);
-		goto exit;
-	}
-
 	/* Prepare IV: [SALT (4 octets)][SEQNO (8 octets)]
 	 * In case we're in cluster-key mode, SALT is varied by xor-ing with
 	 * the source address (or w0 of id), otherwise with the dest address
@@ -788,78 +632,12 @@ static int tipc_aead_encrypt(struct tipc_aead *aead, struct sk_buff *skb,
 	memcpy(iv, &salt, 4);
 	memcpy(iv + 4, (u8 *)&ehdr->seqno, 8);
 
-	/* Prepare request */
 	ehsz = tipc_ehdr_size(ehdr);
-	aead_request_set_tfm(req, tfm);
-	aead_request_set_ad(req, ehsz);
-	aead_request_set_crypt(req, sg, sg, len - ehsz, iv);
 
-	/* Set callback function & data */
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
-				  tipc_aead_encrypt_done, skb);
-	tx_ctx = (struct tipc_crypto_tx_ctx *)ctx;
-	tx_ctx->aead = aead;
-	tx_ctx->bearer = b;
-	memcpy(&tx_ctx->dst, dst, sizeof(*dst));
-
-	/* Hold bearer */
-	if (unlikely(!tipc_bearer_hold(b))) {
-		rc = -ENODEV;
-		goto exit;
-	}
-
-	/* Get net to avoid freed tipc_crypto when delete namespace */
-	if (!maybe_get_net(aead->crypto->net)) {
-		tipc_bearer_put(b);
-		rc = -ENODEV;
-		goto exit;
-	}
-
-	/* Now, do encrypt */
-	rc = crypto_aead_encrypt(req);
-	if (rc == -EINPROGRESS || rc == -EBUSY)
-		return rc;
-
-	tipc_bearer_put(b);
-	put_net(aead->crypto->net);
-
-exit:
-	kfree(ctx);
-	TIPC_SKB_CB(skb)->crypto_ctx = NULL;
-	return rc;
-}
-
-static void tipc_aead_encrypt_done(void *data, int err)
-{
-	struct sk_buff *skb = data;
-	struct tipc_crypto_tx_ctx *tx_ctx = TIPC_SKB_CB(skb)->crypto_ctx;
-	struct tipc_bearer *b = tx_ctx->bearer;
-	struct tipc_aead *aead = tx_ctx->aead;
-	struct tipc_crypto *tx = aead->crypto;
-	struct net *net = tx->net;
-
-	switch (err) {
-	case 0:
-		this_cpu_inc(tx->stats->stat[STAT_ASYNC_OK]);
-		rcu_read_lock();
-		if (likely(test_bit(0, &b->up)))
-			b->media->send_msg(net, skb, b, &tx_ctx->dst);
-		else
-			kfree_skb(skb);
-		rcu_read_unlock();
-		break;
-	case -EINPROGRESS:
-		return;
-	default:
-		this_cpu_inc(tx->stats->stat[STAT_ASYNC_NOK]);
-		kfree_skb(skb);
-		break;
-	}
-
-	kfree(tx_ctx);
-	tipc_bearer_put(b);
-	tipc_aead_put(aead);
-	put_net(net);
+	/* Encrypt the skb in-place. */
+	aes_gcm_encrypt(skb->data + ehsz, skb->data + ehsz, len - ehsz,
+			skb->data + len, skb->data, ehsz, iv, &aead->gcm_key);
+	return 0;
 }
 
 /**
@@ -871,22 +649,18 @@ static void tipc_aead_encrypt_done(void *data, int err)
  *
  * Return:
  * * 0                   : if the decryption has completed
- * * -EINPROGRESS/-EBUSY : if a callback will be performed
  * * < 0                 : the decryption has failed
  */
 static int tipc_aead_decrypt(struct net *net, struct tipc_aead *aead,
 			     struct sk_buff *skb, struct tipc_bearer *b)
 {
-	struct tipc_crypto_rx_ctx *rx_ctx;
-	struct aead_request *req;
-	struct crypto_aead *tfm;
+	struct aes_gcm_ctx ctx;
 	struct sk_buff *unused;
-	struct scatterlist *sg;
 	struct tipc_ehdr *ehdr;
-	int ehsz, nsg, rc;
-	void *ctx;
+	int ehsz, nsg, rc, crypt_len;
 	u32 salt;
-	u8 *iv;
+	u8 iv[TIPC_AES_GCM_IV_SIZE];
+	u8 authtag[TIPC_AES_GCM_TAG_SIZE];
 
 	if (unlikely(!aead))
 		return -ENOKEY;
@@ -895,21 +669,6 @@ static int tipc_aead_decrypt(struct net *net, struct tipc_aead *aead,
 	if (unlikely(nsg < 0)) {
 		pr_err("RX: skb_cow_data() returned %d\n", nsg);
 		return nsg;
-	}
-
-	/* Allocate memory for the AEAD operation */
-	tfm = tipc_aead_tfm_next(aead);
-	ctx = tipc_aead_mem_alloc(tfm, sizeof(*rx_ctx), &iv, &req, &sg, nsg);
-	if (unlikely(!ctx))
-		return -ENOMEM;
-	TIPC_SKB_CB(skb)->crypto_ctx = ctx;
-
-	/* Map skb to the sg lists */
-	sg_init_table(sg, nsg);
-	rc = skb_to_sgvec(skb, sg, 0, skb->len);
-	if (unlikely(rc < 0)) {
-		pr_err("RX: skb_to_sgvec() returned %d, nsg %d\n", rc, nsg);
-		goto exit;
 	}
 
 	/* Reconstruct IV: */
@@ -922,77 +681,19 @@ static int tipc_aead_decrypt(struct net *net, struct tipc_aead *aead,
 	memcpy(iv, &salt, 4);
 	memcpy(iv + 4, (u8 *)&ehdr->seqno, 8);
 
-	/* Prepare request */
 	ehsz = tipc_ehdr_size(ehdr);
-	aead_request_set_tfm(req, tfm);
-	aead_request_set_ad(req, ehsz);
-	aead_request_set_crypt(req, sg, sg, skb->len - ehsz, iv);
+	crypt_len = skb->len - ehsz - aead->authsize;
+	if (unlikely(crypt_len < 0))
+		return -EBADMSG;
 
-	/* Set callback function & data */
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
-				  tipc_aead_decrypt_done, skb);
-	rx_ctx = (struct tipc_crypto_rx_ctx *)ctx;
-	rx_ctx->aead = aead;
-	rx_ctx->bearer = b;
-
-	/* Hold bearer */
-	if (unlikely(!tipc_bearer_hold(b))) {
-		rc = -ENODEV;
-		goto exit;
-	}
-
-	/* Get net to avoid freed tipc_crypto when delete namespace */
-	if (!maybe_get_net(net)) {
-		tipc_bearer_put(b);
-		rc = -ENODEV;
-		goto exit;
-	}
-
-	/* Now, do decrypt */
-	rc = crypto_aead_decrypt(req);
-	if (rc == -EINPROGRESS || rc == -EBUSY)
+	rc = skb_copy_bits(skb, skb->len - aead->authsize, authtag,
+			   aead->authsize);
+	if (unlikely(rc < 0))
 		return rc;
 
-	tipc_bearer_put(b);
-	put_net(net);
-
-exit:
-	kfree(ctx);
-	TIPC_SKB_CB(skb)->crypto_ctx = NULL;
-	return rc;
-}
-
-static void tipc_aead_decrypt_done(void *data, int err)
-{
-	struct sk_buff *skb = data;
-	struct tipc_crypto_rx_ctx *rx_ctx = TIPC_SKB_CB(skb)->crypto_ctx;
-	struct tipc_bearer *b = rx_ctx->bearer;
-	struct tipc_aead *aead = rx_ctx->aead;
-	struct tipc_crypto_stats __percpu *stats = aead->crypto->stats;
-	struct net *net = aead->crypto->net;
-
-	switch (err) {
-	case 0:
-		this_cpu_inc(stats->stat[STAT_ASYNC_OK]);
-		break;
-	case -EINPROGRESS:
-		return;
-	default:
-		this_cpu_inc(stats->stat[STAT_ASYNC_NOK]);
-		break;
-	}
-
-	kfree(rx_ctx);
-	tipc_crypto_rcv_complete(net, aead, b, &skb, err);
-	if (likely(skb)) {
-		if (likely(test_bit(0, &b->up)))
-			tipc_rcv(net, skb, b);
-		else
-			kfree_skb(skb);
-	}
-
-	tipc_bearer_put(b);
-	put_net(net);
+	aes_gcm_init(&ctx, iv, &aead->gcm_key);
+	tipc_decrypt_skb(&ctx, skb, ehsz, crypt_len);
+	return aes_gcm_decrypt_final(&ctx, authtag);
 }
 
 static inline int tipc_ehdr_size(struct tipc_ehdr *ehdr)
@@ -1680,7 +1381,6 @@ static inline void tipc_crypto_clone_msg(struct net *net, struct sk_buff *_skb,
  *
  * Return:
  * * 0                   : the encryption has succeeded (or no encryption)
- * * -EINPROGRESS/-EBUSY : the encryption is ongoing, a callback will be made
  * * -ENOKEK             : the encryption has failed due to no key
  * * -EKEYREVOKED        : the encryption has failed due to key revoked
  * * -ENOMEM             : the encryption has failed due to no memory
@@ -1769,11 +1469,6 @@ exit:
 	case 0:
 		this_cpu_inc(stats->stat[STAT_OK]);
 		break;
-	case -EINPROGRESS:
-	case -EBUSY:
-		this_cpu_inc(stats->stat[STAT_ASYNC]);
-		*skb = NULL;
-		return rc;
 	default:
 		this_cpu_inc(stats->stat[STAT_NOK]);
 		if (rc == -ENOKEY)
@@ -1805,7 +1500,6 @@ exit:
  *
  * Return:
  * * 0                   : the decryption has successfully completed
- * * -EINPROGRESS/-EBUSY : the decryption is ongoing, a callback will be made
  * * -ENOKEY             : the decryption has failed due to no key
  * * -EBADMSG            : the decryption has failed due to bad message
  * * -ENOMEM             : the decryption has failed due to no memory
@@ -1859,11 +1553,6 @@ exit:
 	case 0:
 		this_cpu_inc(stats->stat[STAT_OK]);
 		break;
-	case -EINPROGRESS:
-	case -EBUSY:
-		this_cpu_inc(stats->stat[STAT_ASYNC]);
-		*skb = NULL;
-		return rc;
 	default:
 		this_cpu_inc(stats->stat[STAT_NOK]);
 		if (rc == -ENOKEY) {

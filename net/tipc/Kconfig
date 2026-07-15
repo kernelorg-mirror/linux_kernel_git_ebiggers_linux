@@ -38,9 +38,7 @@ config TIPC_MEDIA_UDP
 config TIPC_CRYPTO
 	bool "TIPC encryption support"
 	depends on TIPC
-	select CRYPTO
-	select CRYPTO_AES
-	select CRYPTO_GCM
+	select CRYPTO_LIB_AES_GCM
 	default y
 	help
 	  Saying Y here will enable support for TIPC encryption.

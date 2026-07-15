@@ -67,6 +67,12 @@ static struct ctl_table tipc_table[] = {
 	},
 #ifdef CONFIG_TIPC_CRYPTO
 	{
+		/*
+		 * This sysctl no longer has any effect on the way that TIPC
+		 * uses the crypto subsystem.  However, a special value can
+		 * still be written to this to trigger debug commands.  See
+		 * tipc_crypto_do_cmd().
+		 */
 		.procname	= "max_tfms",
 		.data		= &sysctl_tipc_max_tfms,
 		.maxlen		= sizeof(sysctl_tipc_max_tfms),
