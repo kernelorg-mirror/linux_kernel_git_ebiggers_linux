@@ -13,6 +13,7 @@
 #include <linux/crypto.h>
 #include <linux/rcupdate.h>
 #include <crypto/aes-cbc-macs.h>
+#include <crypto/aes-ccm.h>
 #include <crypto/aes-gcm.h>
 #include <crypto/arc4.h>
 #include <net/mac80211.h>
@@ -90,7 +91,7 @@ struct ieee80211_key {
 			 * Management frames.
 			 */
 			u8 rx_pn[IEEE80211_NUM_TIDS + 1][IEEE80211_CCMP_PN_LEN];
-			struct crypto_aead *tfm;
+			struct aes_ccm_key key;
 			u32 replays; /* dot11RSNAStatsCCMPReplays */
 		} ccmp;
 		struct {
@@ -112,7 +113,7 @@ struct ieee80211_key {
 			 * Management frames.
 			 */
 			u8 rx_pn[IEEE80211_NUM_TIDS + 1][IEEE80211_GCMP_PN_LEN];
-			struct crypto_aead *tfm;
+			struct aes_gcm_key key;
 			u32 replays; /* dot11RSNAStatsGCMPReplays */
 		} gcmp;
 		struct {

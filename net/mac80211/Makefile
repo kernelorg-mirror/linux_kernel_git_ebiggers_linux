@@ -7,7 +7,6 @@ mac80211-y := \
 	driver-ops.o \
 	sta_info.o \
 	wep.o \
-	aead_api.o \
 	wpa.o \
 	scan.o offchannel.o \
 	ht.o agg-tx.o agg-rx.o \

@@ -492,7 +492,7 @@ static int ccmp_encrypt_skb(struct ieee80211_tx_data *tx, struct sk_buff *skb,
 	ccmp_special_blocks(skb, pn, b_0, aad,
 			    key->conf.flags & IEEE80211_KEY_FLAG_SPP_AMSDU,
 			    false);
-	return ieee80211_aes_ccm_encrypt(key->u.ccmp.tfm, b_0, aad, pos, len,
+	return ieee80211_aes_ccm_encrypt(&key->u.ccmp.key, b_0, aad, pos, len,
 					 skb_put(skb, mic_len));
 }
 
@@ -587,7 +587,7 @@ ieee80211_crypto_ccmp_decrypt(struct ieee80211_rx_data *rx,
 					    aad_nonce_computed);
 
 			if (ieee80211_aes_ccm_decrypt(
-				    key->u.ccmp.tfm, b_0, aad,
+				    &key->u.ccmp.key, b_0, aad,
 				    skb->data + hdrlen + IEEE80211_CCMP_HDR_LEN,
 				    data_len,
 				    skb->data + skb->len - mic_len))
@@ -709,8 +709,9 @@ static int gcmp_encrypt_skb(struct ieee80211_tx_data *tx, struct sk_buff *skb)
 	gcmp_special_blocks(skb, pn, j_0, aad,
 			    key->conf.flags & IEEE80211_KEY_FLAG_SPP_AMSDU,
 			    false);
-	return ieee80211_aes_gcm_encrypt(key->u.gcmp.tfm, j_0, aad, pos, len,
-					 skb_put(skb, IEEE80211_GCMP_MIC_LEN));
+	ieee80211_aes_gcm_encrypt(&key->u.gcmp.key, j_0, aad, pos, len,
+				  skb_put(skb, IEEE80211_GCMP_MIC_LEN));
+	return 0;
 }
 
 ieee80211_tx_result
@@ -798,7 +799,7 @@ ieee80211_crypto_gcmp_decrypt(struct ieee80211_rx_data *rx)
 					    aad_nonce_computed);
 
 			if (ieee80211_aes_gcm_decrypt(
-				    key->u.gcmp.tfm, j_0, aad,
+				    &key->u.gcmp.key, j_0, aad,
 				    skb->data + hdrlen + IEEE80211_GCMP_HDR_LEN,
 				    data_len,
 				    skb->data + skb->len -
