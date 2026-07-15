@@ -3,10 +3,8 @@
  * Copyright (C) 2021 sigma star gmbh
  */
 
-#include <crypto/aead.h>
 #include <crypto/aes.h>
-#include <crypto/algapi.h>
-#include <crypto/gcm.h>
+#include <crypto/aes-gcm.h>
 #include <crypto/skcipher.h>
 #include <keys/trusted-type.h>
 #include <linux/key-type.h>
@@ -126,64 +124,25 @@ out:
 	return res;
 }
 
-static int do_aead_crypto(u8 *in, u8 *out, size_t len, u8 *key, u8 *nonce,
+static int do_aead_crypto(u8 *in, u8 *out, size_t len,
+			  const u8 key[AES_KEYSIZE_128], const u8 nonce[12],
 			  bool do_encrypt)
 {
-	struct aead_request *aead_req = NULL;
-	struct scatterlist src_sg, dst_sg;
-	struct crypto_aead *aead;
+	struct aes_gcm_key gcm;
 	int ret;
-	DECLARE_CRYPTO_WAIT(wait);
 
-	aead = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(aead)) {
-		ret = PTR_ERR(aead);
-		goto out;
-	}
+	ret = aes_gcm_preparekey(&gcm, key, AES_KEYSIZE_128, DCP_BLOB_AUTHLEN);
+	if (ret) /* Should never fail here, since valid lengths were used. */
+		return ret;
 
-	ret = crypto_aead_setauthsize(aead, DCP_BLOB_AUTHLEN);
-	if (ret < 0) {
-		pr_err("Can't set crypto auth tag len: %d\n", ret);
-		goto free_aead;
-	}
-
-	aead_req = aead_request_alloc(aead, GFP_KERNEL);
-	if (!aead_req) {
-		ret = -ENOMEM;
-		goto free_aead;
-	}
-
-	sg_init_one(&src_sg, in, len);
 	if (do_encrypt) {
-		/*
-		 * If we encrypt our buffer has extra space for the auth tag.
-		 */
-		sg_init_one(&dst_sg, out, len + DCP_BLOB_AUTHLEN);
+		aes_gcm_encrypt(out, in, len, out + len, NULL, 0, nonce, &gcm);
+		ret = 0;
 	} else {
-		sg_init_one(&dst_sg, out, len);
+		ret = aes_gcm_decrypt(out, in, len, in + len, NULL, 0, nonce,
+				      &gcm);
 	}
-
-	aead_request_set_crypt(aead_req, &src_sg, &dst_sg, len, nonce);
-	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_SLEEP,
-				  crypto_req_done, &wait);
-	aead_request_set_ad(aead_req, 0);
-
-	if (crypto_aead_setkey(aead, key, AES_KEYSIZE_128)) {
-		pr_err("Can't set crypto AEAD key\n");
-		ret = -EINVAL;
-		goto free_req;
-	}
-
-	if (do_encrypt)
-		ret = crypto_wait_req(crypto_aead_encrypt(aead_req), &wait);
-	else
-		ret = crypto_wait_req(crypto_aead_decrypt(aead_req), &wait);
-
-free_req:
-	aead_request_free(aead_req);
-free_aead:
-	crypto_free_aead(aead);
-out:
+	memzero_explicit(&gcm, sizeof(gcm));
 	return ret;
 }
 
@@ -273,8 +232,8 @@ static int trusted_dcp_unseal(struct trusted_key_payload *p, char *datablob)
 		goto out;
 	}
 
-	ret = do_aead_crypto(b->payload, p->key, p->key_len + DCP_BLOB_AUTHLEN,
-			     plain_blob_key, b->nonce, false);
+	ret = do_aead_crypto(b->payload, p->key, p->key_len, plain_blob_key,
+			     b->nonce, false);
 	if (ret) {
 		pr_err("Unwrap of DCP payload failed: %i\n", ret);
 		goto out;
