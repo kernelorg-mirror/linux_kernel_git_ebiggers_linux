@@ -6,14 +6,12 @@
  * Phoebe Buckheister <phoebe.buckheister@itwm.fraunhofer.de>
  */
 
-#include <linux/err.h>
 #include <linux/bug.h>
-#include <linux/completion.h>
 #include <linux/ieee802154.h>
 #include <linux/rculist.h>
 
-#include <crypto/aead.h>
-#include <crypto/skcipher.h>
+#include <crypto/aes-ccm.h>
+#include <crypto/aes-ctr.h>
 
 #include "ieee802154_i.h"
 #include "llsec.h"
@@ -110,11 +108,13 @@ int mac802154_llsec_set_params(struct mac802154_llsec *sec,
 	return 0;
 }
 
+static const int authsizes[3] = { 4, 8, 16 };
+
 static struct mac802154_llsec_key*
 llsec_key_alloc(const struct ieee802154_llsec_key *template)
 {
-	const int authsizes[3] = { 4, 8, 16 };
 	struct mac802154_llsec_key *key;
+	int err;
 	int i;
 
 	key = kzalloc_obj(*key);
@@ -124,37 +124,21 @@ llsec_key_alloc(const struct ieee802154_llsec_key *template)
 	kref_init(&key->ref);
 	key->key = *template;
 
-	BUILD_BUG_ON(ARRAY_SIZE(authsizes) != ARRAY_SIZE(key->tfm));
-
-	for (i = 0; i < ARRAY_SIZE(key->tfm); i++) {
-		key->tfm[i] = crypto_alloc_aead("ccm(aes)", 0,
-						CRYPTO_ALG_ASYNC);
-		if (IS_ERR(key->tfm[i]))
-			goto err_tfm;
-		if (crypto_aead_setkey(key->tfm[i], template->key,
-				       IEEE802154_LLSEC_KEY_SIZE))
-			goto err_tfm;
-		if (crypto_aead_setauthsize(key->tfm[i], authsizes[i]))
-			goto err_tfm;
+	BUILD_BUG_ON(ARRAY_SIZE(authsizes) != ARRAY_SIZE(key->ccm_keys));
+	for (i = 0; i < ARRAY_SIZE(key->ccm_keys); i++) {
+		err = aes_ccm_preparekey(&key->ccm_keys[i], template->key,
+					 IEEE802154_LLSEC_KEY_SIZE,
+					 authsizes[i]);
+		if (err)
+			goto err_free;
 	}
-
-	key->tfm0 = crypto_alloc_sync_skcipher("ctr(aes)", 0, 0);
-	if (IS_ERR(key->tfm0))
-		goto err_tfm;
-
-	if (crypto_sync_skcipher_setkey(key->tfm0, template->key,
-				   IEEE802154_LLSEC_KEY_SIZE))
-		goto err_tfm0;
-
+	err = aes_prepareenckey(&key->ctr_key, template->key,
+				IEEE802154_LLSEC_KEY_SIZE);
+	if (err)
+		goto err_free;
 	return key;
 
-err_tfm0:
-	crypto_free_sync_skcipher(key->tfm0);
-err_tfm:
-	for (i = 0; i < ARRAY_SIZE(key->tfm); i++)
-		if (!IS_ERR_OR_NULL(key->tfm[i]))
-			crypto_free_aead(key->tfm[i]);
-
+err_free:
 	kfree_sensitive(key);
 	return NULL;
 }
@@ -162,14 +146,8 @@ err_tfm:
 static void llsec_key_release(struct kref *ref)
 {
 	struct mac802154_llsec_key *key;
-	int i;
 
 	key = container_of(ref, struct mac802154_llsec_key, ref);
-
-	for (i = 0; i < ARRAY_SIZE(key->tfm); i++)
-		crypto_free_aead(key->tfm[i]);
-
-	crypto_free_sync_skcipher(key->tfm0);
 	kfree_sensitive(key);
 }
 
@@ -621,34 +599,24 @@ llsec_do_encrypt_unauth(struct sk_buff *skb, const struct mac802154_llsec *sec,
 			struct mac802154_llsec_key *key)
 {
 	u8 iv[16];
-	struct scatterlist src;
-	SYNC_SKCIPHER_REQUEST_ON_STACK(req, key->tfm0);
-	int err, datalen;
+	int datalen;
 	unsigned char *data;
 
 	llsec_geniv(iv, sec->params.hwaddr, &hdr->sec);
 	/* Compute data payload offset and data length */
 	data = skb_mac_header(skb) + skb->mac_len;
 	datalen = skb_tail_pointer(skb) - data;
-	sg_init_one(&src, data, datalen);
 
-	skcipher_request_set_sync_tfm(req, key->tfm0);
-	skcipher_request_set_callback(req, 0, NULL, NULL);
-	skcipher_request_set_crypt(req, &src, &src, datalen, iv);
-	err = crypto_skcipher_encrypt(req);
-	skcipher_request_zero(req);
-	return err;
+	aes_ctr(data, data, datalen, iv, &key->ctr_key);
+	return 0;
 }
 
-static struct crypto_aead*
-llsec_tfm_by_len(struct mac802154_llsec_key *key, int authlen)
+static const struct aes_ccm_key *
+llsec_ccm_key_by_authlen(const struct mac802154_llsec_key *key, int authlen)
 {
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(key->tfm); i++)
-		if (crypto_aead_authsize(key->tfm[i]) == authlen)
-			return key->tfm[i];
-
+	for (int i = 0; i < ARRAY_SIZE(authsizes); i++)
+		if (authsizes[i] == authlen)
+			return &key->ccm_keys[i];
 	BUG();
 }
 
@@ -658,41 +626,29 @@ llsec_do_encrypt_auth(struct sk_buff *skb, const struct mac802154_llsec *sec,
 		      struct mac802154_llsec_key *key)
 {
 	u8 iv[16];
-	unsigned char *data;
-	int authlen, assoclen, datalen, rc;
-	struct scatterlist sg;
-	struct aead_request *req;
+	u8 *authtag, *assoc, *data;
+	int authlen, assoclen, datalen;
 
 	authlen = ieee802154_sechdr_authtag_len(&hdr->sec);
 	llsec_geniv(iv, sec->params.hwaddr, &hdr->sec);
 
-	req = aead_request_alloc(llsec_tfm_by_len(key, authlen), GFP_ATOMIC);
-	if (!req)
-		return -ENOMEM;
-
+	assoc = skb_mac_header(skb);
 	assoclen = skb->mac_len;
-
-	data = skb_mac_header(skb) + skb->mac_len;
+	data = assoc + assoclen;
 	datalen = skb_tail_pointer(skb) - data;
+	authtag = &data[datalen];
 
 	skb_put(skb, authlen);
-
-	sg_init_one(&sg, skb_mac_header(skb), assoclen + datalen + authlen);
 
 	if (!(hdr->sec.level & IEEE802154_SCF_SECLEVEL_ENC)) {
 		assoclen += datalen;
 		datalen = 0;
 	}
 
-	aead_request_set_callback(req, 0, NULL, NULL);
-	aead_request_set_crypt(req, &sg, &sg, datalen, iv);
-	aead_request_set_ad(req, assoclen);
-
-	rc = crypto_aead_encrypt(req);
-
-	kfree_sensitive(req);
-
-	return rc;
+	return aes_ccm_encrypt(data, data, datalen, authtag, assoc, assoclen,
+			       /* This just takes the nonce directly. */
+			       &iv[1], 13,
+			       llsec_ccm_key_by_authlen(key, authlen));
 }
 
 static int llsec_do_encrypt(struct sk_buff *skb,
@@ -849,23 +805,13 @@ llsec_do_decrypt_unauth(struct sk_buff *skb, const struct mac802154_llsec *sec,
 	u8 iv[16];
 	unsigned char *data;
 	int datalen;
-	struct scatterlist src;
-	SYNC_SKCIPHER_REQUEST_ON_STACK(req, key->tfm0);
-	int err;
 
 	llsec_geniv(iv, dev_addr, &hdr->sec);
 	data = skb_mac_header(skb) + skb->mac_len;
 	datalen = skb_tail_pointer(skb) - data;
 
-	sg_init_one(&src, data, datalen);
-
-	skcipher_request_set_sync_tfm(req, key->tfm0);
-	skcipher_request_set_callback(req, 0, NULL, NULL);
-	skcipher_request_set_crypt(req, &src, &src, datalen, iv);
-
-	err = crypto_skcipher_decrypt(req);
-	skcipher_request_zero(req);
-	return err;
+	aes_ctr(data, data, datalen, iv, &key->ctr_key);
+	return 0;
 }
 
 static int
@@ -874,37 +820,31 @@ llsec_do_decrypt_auth(struct sk_buff *skb, const struct mac802154_llsec *sec,
 		      struct mac802154_llsec_key *key, __le64 dev_addr)
 {
 	u8 iv[16];
-	unsigned char *data;
+	u8 *authtag, *assoc, *data;
 	int authlen, datalen, assoclen, rc;
-	struct scatterlist sg;
-	struct aead_request *req;
 
 	authlen = ieee802154_sechdr_authtag_len(&hdr->sec);
 	llsec_geniv(iv, dev_addr, &hdr->sec);
 
-	req = aead_request_alloc(llsec_tfm_by_len(key, authlen), GFP_ATOMIC);
-	if (!req)
-		return -ENOMEM;
-
+	assoc = skb_mac_header(skb);
 	assoclen = skb->mac_len;
-
-	data = skb_mac_header(skb) + skb->mac_len;
+	data = assoc + assoclen;
 	datalen = skb_tail_pointer(skb) - data;
 
-	sg_init_one(&sg, skb_mac_header(skb), assoclen + datalen);
+	if (datalen < authlen)
+		return -EBADMSG;
+	datalen -= authlen;
+	authtag = &data[datalen];
 
 	if (!(hdr->sec.level & IEEE802154_SCF_SECLEVEL_ENC)) {
-		assoclen += datalen - authlen;
-		datalen = authlen;
+		assoclen += datalen;
+		datalen = 0;
 	}
 
-	aead_request_set_callback(req, 0, NULL, NULL);
-	aead_request_set_crypt(req, &sg, &sg, datalen, iv);
-	aead_request_set_ad(req, assoclen);
-
-	rc = crypto_aead_decrypt(req);
-
-	kfree_sensitive(req);
+	rc = aes_ccm_decrypt(data, data, datalen, authtag, assoc, assoclen,
+			     /* This just takes the nonce directly. */
+			     &iv[1], 13,
+			     llsec_ccm_key_by_authlen(key, authlen));
 	skb_trim(skb, skb->len - authlen);
 
 	return rc;

@@ -9,6 +9,8 @@
 #ifndef MAC802154_LLSEC_H
 #define MAC802154_LLSEC_H
 
+#include <crypto/aes-ccm.h>
+#include <crypto/aes-ctr.h>
 #include <linux/slab.h>
 #include <linux/hashtable.h>
 #include <linux/kref.h>
@@ -19,9 +21,9 @@
 struct mac802154_llsec_key {
 	struct ieee802154_llsec_key key;
 
-	/* one tfm for each authsize (4/8/16) */
-	struct crypto_aead *tfm[3];
-	struct crypto_sync_skcipher *tfm0;
+	/* one for each authsize (4/8/16) */
+	struct aes_ccm_key ccm_keys[3];
+	struct aes_enckey ctr_key;
 
 	struct kref ref;
 };
