@@ -8,6 +8,7 @@
 #include <linux/skbuff.h>
 #include <crypto/aes-cbc.h>
 #include <crypto/aes-ecb.h>
+#include <crypto/aes-gcm.h>
 
 /* BPF crypto initialization parameters struct */
 /**
@@ -33,6 +34,7 @@ struct bpf_crypto_params {
 enum bpf_crypto_algo_id {
 	BPF_ALGO_AES_CBC,
 	BPF_ALGO_AES_ECB,
+	BPF_ALGO_AES_GCM,
 };
 
 static const struct {
@@ -42,6 +44,7 @@ static const struct {
 } bpf_crypto_algos[] = {
 	{ "skcipher", "cbc(aes)", BPF_ALGO_AES_CBC },
 	{ "skcipher", "ecb(aes)", BPF_ALGO_AES_ECB },
+	{ "aead", "gcm(aes)", BPF_ALGO_AES_GCM },
 };
 
 static bool bpf_crypto_find_algo(const struct bpf_crypto_params *params,
@@ -72,6 +75,7 @@ struct bpf_crypto_ctx {
 	enum bpf_crypto_algo_id algo;
 	union {
 		struct aes_key aes;
+		struct aes_gcm_key aes_gcm;
 	} key;
 	struct rcu_head rcu;
 	refcount_t usage;
@@ -126,6 +130,10 @@ bpf_crypto_ctx_create(const struct bpf_crypto_params *params, u32 params__sz,
 		else
 			*err = aes_preparekey(&ctx->key.aes, params->key,
 					      params->key_len);
+		break;
+	case BPF_ALGO_AES_GCM:
+		*err = aes_gcm_preparekey(&ctx->key.aes_gcm, params->key,
+					  params->key_len, params->authsize);
 		break;
 	default:
 		WARN_ON(1);
@@ -217,6 +225,28 @@ static int bpf_aes_ecb_crypt(u8 *dst, u32 dst_len, const u8 *src, u32 src_len,
 	return 0;
 }
 
+static int bpf_aes_gcm_crypt(u8 *dst, u32 dst_len, const u8 *src, u32 src_len,
+			     u8 *iv, u32 iv_len,
+			     const struct bpf_crypto_ctx *ctx, bool decrypt)
+{
+	const struct aes_gcm_key *key = &ctx->key.aes_gcm;
+	u32 authtag_len = key->authtag_len;
+
+	if (iv_len != GCM_AES_IV_SIZE)
+		return -EINVAL;
+	if (decrypt) {
+		if (src_len < authtag_len || dst_len < src_len - authtag_len)
+			return -EINVAL;
+		return aes_gcm_decrypt(dst, src, src_len - authtag_len,
+				       src + src_len - authtag_len, NULL, 0, iv,
+				       key);
+	}
+	if (dst_len < authtag_len || dst_len - authtag_len < src_len)
+		return -EINVAL;
+	aes_gcm_encrypt(dst, src, src_len, dst + src_len, NULL, 0, iv, key);
+	return 0;
+}
+
 static int bpf_crypto_crypt(const struct bpf_crypto_ctx *ctx,
 			    const struct bpf_dynptr_kern *src,
 			    const struct bpf_dynptr_kern *dst,
@@ -253,6 +283,9 @@ static int bpf_crypto_crypt(const struct bpf_crypto_ctx *ctx,
 					 iv_len, ctx, decrypt);
 	case BPF_ALGO_AES_ECB:
 		return bpf_aes_ecb_crypt(pdst, dst_len, psrc, src_len, piv,
+					 iv_len, ctx, decrypt);
+	case BPF_ALGO_AES_GCM:
+		return bpf_aes_gcm_crypt(pdst, dst_len, psrc, src_len, piv,
 					 iv_len, ctx, decrypt);
 	default:
 		return -EINVAL;

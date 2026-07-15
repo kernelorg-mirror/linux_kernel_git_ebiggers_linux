@@ -92,12 +92,14 @@ config BPF_CRYPTO
 	depends on BPF_SYSCALL
 	select CRYPTO_LIB_AES_CBC
 	select CRYPTO_LIB_AES_ECB
+	select CRYPTO_LIB_AES_GCM
 	help
 	  Provide the kfuncs needed for BPF programs to encrypt and decrypt
 	  data. The supported algorithms are:
 
 	    - AES-CBC
 	    - AES-ECB
+	    - AES-GCM
 
 source "kernel/bpf/preload/Kconfig"
 
