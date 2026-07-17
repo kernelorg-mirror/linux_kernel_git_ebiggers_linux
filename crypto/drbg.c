@@ -46,41 +46,41 @@
  *
  * Usage without any additional data
  * ---------------------------------
- * struct crypto_rng *drng;
+ * struct drbg_state *drbg;
  * int err;
  * char data[DATALEN];
  *
- * drng = crypto_alloc_rng(drng_name, 0, 0);
- * err = crypto_rng_get_bytes(drng, data, DATALEN);
- * crypto_free_rng(drng);
+ * drbg = crypto_drbg_alloc();
+ * err = crypto_drbg_seed(drbg, NULL, 0);
+ * err = crypto_drbg_get_bytes(drbg, data, sizeof(data), NULL, 0);
+ * crypto_drbg_free(drbg);
  *
  *
  * Usage with personalization string during initialization
  * -------------------------------------------------------
- * struct crypto_rng *drng;
+ * struct drbg_state *drbg;
  * int err;
  * char data[DATALEN];
  * char personalization[11] = "some-string";
  *
- * drng = crypto_alloc_rng(drng_name, 0, 0);
- * // The reset completely re-initializes the DRBG with the provided
- * // personalization string
- * err = crypto_rng_reset(drng, personalization, strlen(personalization));
- * err = crypto_rng_get_bytes(drng, data, DATALEN);
- * crypto_free_rng(drng);
+ * drbg = crypto_drbg_alloc();
+ * err = crypto_drbg_seed(drbg, personalization, sizeof(personalization));
+ * err = crypto_drbg_get_bytes(drbg, data, sizeof(data), NULL, 0);
+ * crypto_drbg_free(drbg);
  *
  *
  * Usage with additional information string during random number request
  * ---------------------------------------------------------------------
- * struct crypto_rng *drng;
+ * struct drbg_state *drbg;
  * int err;
  * char data[DATALEN];
  * char addtl_string[11] = "some-string";
  *
- * drng = crypto_alloc_rng(drng_name, 0, 0);
- * err = crypto_rng_generate(drng, addtl_string, strlen(addtl_string),
-			     data, DATALEN);
- * crypto_free_rng(drng);
+ * drbg = crypto_drbg_alloc();
+ * err = crypto_drbg_seed(drbg, NULL, 0);
+ * err = crypto_drbg_get_bytes(drbg, data, sizeof(data), addtl_string,
+			     sizeof(addtl_string));
+ * crypto_drbg_free(drbg);
  *
  *
  * Usage with personalization and additional information strings
@@ -88,14 +88,20 @@
  * Just mix both scenarios above.
  */
 
-#include <crypto/internal/rng.h>
+#undef pr_fmt
+#define pr_fmt(fmt) "drbg: " fmt
+
+#include <crypto/rng.h>
 #include <crypto/sha2.h>
 #include <linux/fips.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/once.h>
+#include <linux/slab.h>
 #include <linux/string_choices.h>
 #include <linux/unaligned.h>
+#include "drbg-testvecs.h"
 
 /* State length in bytes */
 #define DRBG_STATE_LEN		SHA512_DIGEST_SIZE
@@ -130,7 +136,7 @@ struct drbg_state {
 	/* Number of RNG requests since last reseed -- 10.1.2.1 1c */
 	size_t reseed_ctr;
 	bool instantiated;
-	struct crypto_rng *jent;
+	struct jitterentropy *jent;
 	const u8 *test_entropy;
 	size_t test_entropylen;
 };
@@ -272,9 +278,9 @@ static int drbg_seed(struct drbg_state *drbg, const u8 *pers, size_t pers_len,
 			 * Get seed from Jitter RNG, failures are
 			 * fatal only in FIPS mode.
 			 */
-			ret = crypto_rng_get_bytes(drbg->jent,
-						   &entropy_buf[entropylen],
-						   entropylen);
+			ret = crypto_jent_get_bytes(drbg->jent,
+						    &entropy_buf[entropylen],
+						    entropylen);
 			if (fips_enabled && ret) {
 				pr_devel("DRBG: jent failed with %d\n", ret);
 
@@ -402,36 +408,48 @@ static int drbg_generate(struct drbg_state *drbg, u8 *out, size_t outlen,
 }
 
 /***************************************************************
- * Kernel crypto API interface to DRBG
+ * Public API
  ***************************************************************/
 
-static int drbg_kcapi_init(struct crypto_tfm *tfm)
+static void drbg_selftest(void);
+
+static struct drbg_state *__crypto_drbg_alloc(void)
 {
-	struct drbg_state *drbg = crypto_tfm_ctx(tfm);
+	struct drbg_state *drbg = kzalloc_obj(*drbg);
 
-	mutex_init(&drbg->drbg_mutex);
-
-	return 0;
+	if (drbg)
+		mutex_init(&drbg->drbg_mutex);
+	return drbg;
 }
 
-/* Set test entropy in the DRBG. */
-static void drbg_kcapi_set_entropy(struct crypto_rng *tfm,
-				   const u8 *data, unsigned int len)
+struct drbg_state *crypto_drbg_alloc(void)
 {
-	struct drbg_state *drbg = crypto_rng_ctx(tfm);
+	/*
+	 * Run the self-tests if they haven't been run already, so that untested
+	 * DRBG instances can't be used.  The tests get run by the initcall
+	 * anyway, but the timing of that is relatively late (late_initcall),
+	 * due to jitterentropy supposedly needing to be at module_init.
+	 */
+	drbg_selftest();
+	return __crypto_drbg_alloc();
+}
+EXPORT_SYMBOL_GPL(crypto_drbg_alloc);
 
+/* Set test entropy in the DRBG. */
+void crypto_drbg_set_entropy(struct drbg_state *drbg, const u8 *data,
+			     size_t len)
+{
 	mutex_lock(&drbg->drbg_mutex);
 	drbg->test_entropy = data;
 	drbg->test_entropylen = len;
 	mutex_unlock(&drbg->drbg_mutex);
 }
+EXPORT_SYMBOL_GPL(crypto_drbg_set_entropy);
 
 /* Seed (i.e. instantiate) or re-seed the DRBG. */
-static int drbg_kcapi_seed(struct crypto_rng *tfm,
-			   const u8 *pers, unsigned int pers_len)
+int crypto_drbg_seed(struct drbg_state *drbg, const u8 *pers, size_t pers_len)
 {
 	static const u8 initial_key[DRBG_STATE_LEN]; /* all zeroes */
-	struct drbg_state *drbg = crypto_rng_ctx(tfm);
 	int ret;
 
 	pr_devel("DRBG: Initializing DRBG\n");
@@ -452,69 +470,131 @@ static int drbg_kcapi_seed(struct crypto_rng *tfm,
 	memset(drbg->V, 1, DRBG_STATE_LEN);
 	hmac_sha512_preparekey(&drbg->key, initial_key, DRBG_STATE_LEN);
 
-	/* Allocate jitterentropy_rng if not in test mode. */
+	/* Allocate jitterentropy if not in test mode. */
 	if (drbg->test_entropylen == 0) {
-		drbg->jent = crypto_alloc_rng("jitterentropy_rng", 0, 0);
-		if (IS_ERR(drbg->jent)) {
-			ret = PTR_ERR(drbg->jent);
-			drbg->jent = NULL;
+		drbg->jent = crypto_jent_alloc();
+		if (!drbg->jent) {
 			if (fips_enabled)
-				return ret;
+				return -ENOMEM;
 			pr_info("DRBG: Continuing without Jitter RNG\n");
 		}
 	}
 
 	ret = drbg_seed(drbg, pers, pers_len, /* reseed= */ false);
 	if (ret) {
-		crypto_free_rng(drbg->jent);
+		crypto_jent_free(drbg->jent);
 		drbg->jent = NULL;
 		return ret;
 	}
 	drbg->instantiated = true;
 	return 0;
 }
+EXPORT_SYMBOL_GPL(crypto_drbg_seed);
 
-/*
- * Generate random numbers invoked by the kernel crypto API:
+/**
+ * crypto_drbg_get_bytes() - Generate random numbers
  *
- * src is additional input supplied to the RNG.
- * slen is the length of src.
- * dst is the output buffer where random data is to be stored.
- * dlen is the length of dst.
+ * @drbg: a DRBG instance.  crypto_drbg_seed() must have been called.
+ * @out: the output buffer where random data is to be stored
+ * @out_len: number of random bytes to generate
+ * @addtl: optional additional input supplied to the RNG
+ * @addtl_len: length of addtl in bytes, possibly 0
+ *
+ * Context: May sleep
+ * Return: 0 on success, -errno on error
  */
-static int drbg_kcapi_generate(struct crypto_rng *tfm,
-			       const u8 *src, unsigned int slen,
-			       u8 *dst, unsigned int dlen)
+int crypto_drbg_get_bytes(struct drbg_state *drbg, u8 *out, size_t out_len,
+			  const u8 *addtl, size_t addtl_len)
 {
-	struct drbg_state *drbg = crypto_rng_ctx(tfm);
-
 	/*
 	 * Break the request into multiple requests if needed, to avoid
 	 * exceeding the maximum request length of the core algorithm.
 	 */
 	do {
-		unsigned int n = min(dlen, DRBG_MAX_REQUEST_BYTES);
+		size_t n = min(out_len, DRBG_MAX_REQUEST_BYTES);
 		int err;
 
 		mutex_lock(&drbg->drbg_mutex);
-		err = drbg_generate(drbg, dst, n, src, slen);
+		err = drbg_generate(drbg, out, n, addtl, addtl_len);
 		mutex_unlock(&drbg->drbg_mutex);
 		if (err < 0)
 			return err;
-		dst += n;
-		dlen -= n;
-	} while (dlen);
+		out += n;
+		out_len -= n;
+	} while (out_len);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(crypto_drbg_get_bytes);
+
+/* Uninstantiate the DRBG. */
+void crypto_drbg_free(struct drbg_state *drbg)
+{
+	if (drbg) {
+		mutex_destroy(&drbg->drbg_mutex);
+		crypto_jent_free(drbg->jent);
+		kfree_sensitive(drbg);
+	}
+}
+EXPORT_SYMBOL_GPL(crypto_drbg_free);
+
+static DEFINE_MUTEX(crypto_default_rng_lock);
+static struct drbg_state *crypto_default_rng;
+static int crypto_default_rng_refcnt;
+
+static int crypto_get_default_rng(void)
+{
+	struct drbg_state *drbg;
+	int err;
+
+	guard(mutex)(&crypto_default_rng_lock);
+	if (!crypto_default_rng) {
+		drbg = crypto_drbg_alloc();
+		if (!drbg)
+			return -ENOMEM;
+
+		err = crypto_drbg_seed(drbg, NULL, 0);
+		if (err) {
+			crypto_drbg_free(drbg);
+			return err;
+		}
+		crypto_default_rng = drbg;
+	}
+
+	crypto_default_rng_refcnt++;
 	return 0;
 }
 
-/* Uninstantiate the DRBG. */
-static void drbg_kcapi_exit(struct crypto_tfm *tfm)
+static void crypto_put_default_rng(void)
 {
-	struct drbg_state *drbg = crypto_tfm_ctx(tfm);
-
-	crypto_free_rng(drbg->jent);
-	memzero_explicit(drbg, sizeof(*drbg));
+	guard(mutex)(&crypto_default_rng_lock);
+	crypto_default_rng_refcnt--;
 }
+
+int __crypto_stdrng_get_bytes(void *buf, size_t len)
+{
+	int err;
+
+	err = crypto_get_default_rng();
+	if (err)
+		return err;
+
+	err = crypto_drbg_get_bytes(crypto_default_rng, buf, len, NULL, 0);
+	crypto_put_default_rng();
+	return err;
+}
+EXPORT_SYMBOL_GPL(__crypto_stdrng_get_bytes);
+
+int crypto_del_default_rng(void)
+{
+	guard(mutex)(&crypto_default_rng_lock);
+	if (crypto_default_rng_refcnt)
+		return -EBUSY;
+
+	crypto_drbg_free(crypto_default_rng);
+	crypto_default_rng = NULL;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(crypto_del_default_rng);
 
 /*
  * Tests as defined in 11.3.2 in addition to the cipher tests: testing
@@ -526,20 +606,16 @@ static void drbg_kcapi_exit(struct crypto_tfm *tfm)
  * Note 2: There is no sensible way of testing the reseed counter
  * enforcement, so skip it.
  */
-static inline int __init drbg_healthcheck_sanity(void)
+static void __init drbg_healthcheck_sanity(void)
 {
 #define OUTBUFLEN 16
 	u8 buf[OUTBUFLEN];
 	struct drbg_state *drbg = NULL;
 	int ret;
 
-	/* only perform test in FIPS mode */
-	if (!fips_enabled)
-		return 0;
-
 	drbg = kzalloc_obj(struct drbg_state);
 	if (!drbg)
-		return -ENOMEM;
+		panic("Out of memory");
 
 	guard(mutex_init)(&drbg->drbg_mutex);
 	drbg->instantiated = true;
@@ -569,49 +645,100 @@ static inline int __init drbg_healthcheck_sanity(void)
 		 "completed\n");
 
 	kfree(drbg);
+}
+
+DEFINE_FREE(crypto_drbg_free, struct drbg_state *, if (_T) crypto_drbg_free(_T))
+
+static int __init drbg_selftest_one_vec(const struct drbg_testvec *test)
+{
+	struct drbg_state *drbg __free(crypto_drbg_free) = NULL;
+	unsigned char *buf __free(kfree_sensitive) = NULL;
+	int err;
+
+	buf = kzalloc(test->expectedlen, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	drbg = __crypto_drbg_alloc();
+	if (!drbg)
+		return -ENOMEM;
+
+	crypto_drbg_set_entropy(drbg, test->entropy, test->entropylen);
+	err = crypto_drbg_seed(drbg, test->pers, test->perslen);
+	if (err) {
+		pr_err("Instantiation failed: %d\n", err);
+		return err;
+	}
+
+	if (test->ent_reseed_len) {
+		crypto_drbg_set_entropy(drbg, test->ent_reseed,
+					test->ent_reseed_len);
+		err = crypto_drbg_seed(drbg, test->addtl_reseed,
+				       test->addtl_reseed_len);
+		if (err) {
+			pr_err("Reseed failed: %d\n", err);
+			return err;
+		}
+	}
+
+	err = crypto_drbg_get_bytes(drbg, buf, test->expectedlen, test->addtla,
+				    test->addtllen);
+	if (err) {
+		pr_err("Generation failed (first): %d\n", err);
+		return err;
+	}
+
+	err = crypto_drbg_get_bytes(drbg, buf, test->expectedlen, test->addtlb,
+				    test->addtllen);
+	if (err) {
+		pr_err("Generation failed (second): %d\n", err);
+		return err;
+	}
+
+	if (memcmp(test->expected, buf, test->expectedlen) != 0) {
+		pr_err("Actual output doesn't match expected output\n");
+		return -EINVAL;
+	}
 	return 0;
 }
 
-static struct rng_alg drbg_alg = {
-	.base.cra_name		= "stdrng",
-	.base.cra_driver_name	= "drbg_nopr_hmac_sha512",
-	.base.cra_priority	= 201,
-	.base.cra_ctxsize	= sizeof(struct drbg_state),
-	.base.cra_module	= THIS_MODULE,
-	.base.cra_init		= drbg_kcapi_init,
-	.set_ent		= drbg_kcapi_set_entropy,
-	.seed			= drbg_kcapi_seed,
-	.generate		= drbg_kcapi_generate,
-	.base.cra_exit		= drbg_kcapi_exit,
-};
+static void drbg_selftest_once(void)
+{
+	if (!fips_enabled)
+		return;
+	drbg_healthcheck_sanity();
+
+	for (size_t i = 0; i < ARRAY_SIZE(drbg_testvecs); i++) {
+		int err = drbg_selftest_one_vec(&drbg_testvecs[i]);
+
+		if (err)
+			panic("self-test %zu failed: %d\n", i, err);
+	}
+	pr_info("self-tests passed\n");
+}
+
+static void drbg_selftest(void)
+{
+	DO_ONCE_SLEEPABLE(drbg_selftest_once);
+}
 
 static int __init drbg_init(void)
 {
-	int ret;
-
-	ret = drbg_healthcheck_sanity();
-	if (ret)
-		return ret;
-
-	/*
-	 * In FIPS mode, boost the algorithm priority to ensure that when users
-	 * request "stdrng", they really get the algorithm from here.
-	 */
-	if (fips_enabled)
-		drbg_alg.base.cra_priority += 2000;
-
-	return crypto_register_rng(&drbg_alg);
+	drbg_selftest();
+	return 0;
 }
 
 static void __exit drbg_exit(void)
 {
-	crypto_unregister_rng(&drbg_alg);
+	int err;
+
+	err = crypto_del_default_rng();
+	if (err)
+		pr_err("Failed delete default RNG: %d\n", err);
 }
 
-module_init(drbg_init);
+late_initcall(drbg_init); /* after jitterentropy which is module_init */
 module_exit(drbg_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Stephan Mueller <smueller@chronox.de>");
 MODULE_DESCRIPTION("NIST SP800-90A Deterministic Random Bit Generator (DRBG)");
-MODULE_ALIAS_CRYPTO("stdrng");
-MODULE_ALIAS_CRYPTO("drbg_nopr_hmac_sha512");

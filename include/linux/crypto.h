@@ -307,7 +307,7 @@ struct cipher_alg {
  * @cra_type: Type of the cryptographic transformation. This is a pointer to
  *	      struct crypto_type, which implements callbacks common for all
  *	      transformation types. There are multiple options, such as
- *	      &crypto_skcipher_type, &crypto_ahash_type, &crypto_rng_type.
+ *	      &crypto_skcipher_type, &crypto_ahash_type.
  *	      This field might be empty. In that case, there are no common
  *	      callbacks. This is the case for: cipher.
  * @cra_u: Callbacks implementing the transformation. This is a union of
