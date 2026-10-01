@@ -1535,23 +1535,6 @@ static u8 *get_vmpck(int id, struct snp_secrets_page *secrets, u32 **seqno)
 	return key;
 }
 
-static struct aes_gcm_key *snp_init_crypto(const u8 *key, size_t keylen)
-{
-	struct aes_gcm_key *gcm_key;
-
-	gcm_key = kzalloc_obj(*gcm_key);
-	if (!gcm_key)
-		return NULL;
-
-	if (aes_gcm_preparekey(gcm_key, key, keylen, AUTHTAG_LEN)) {
-		pr_err("AES-GCM key preparation failed\n");
-		kfree_sensitive(gcm_key);
-		return NULL;
-	}
-
-	return gcm_key;
-}
-
 int snp_msg_init(struct snp_msg_desc *mdesc, int vmpck_id)
 {
 	/* Adjust the default VMPCK key based on the executing VMPL level */
@@ -1572,9 +1555,12 @@ int snp_msg_init(struct snp_msg_desc *mdesc, int vmpck_id)
 
 	mdesc->vmpck_id = vmpck_id;
 
-	mdesc->gcm_key = snp_init_crypto(mdesc->vmpck, VMPCK_KEY_LEN);
-	if (!mdesc->gcm_key)
-		return -ENOMEM;
+	if (aes_gcm_preparekey(&mdesc->gcm_key, mdesc->vmpck, VMPCK_KEY_LEN,
+			       AUTHTAG_LEN)) {
+		/* This should never happen, since we used valid lengths. */
+		pr_err("AES-GCM key preparation failed\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -1624,7 +1610,6 @@ void snp_msg_free(struct snp_msg_desc *mdesc)
 	if (!mdesc)
 		return;
 
-	kfree_sensitive(mdesc->gcm_key);
 	free_shared_pages(mdesc->response, sizeof(struct snp_guest_msg));
 	free_shared_pages(mdesc->request, sizeof(struct snp_guest_msg));
 	iounmap((__force void __iomem *)mdesc->secrets);
@@ -1709,7 +1694,7 @@ static int verify_and_dec_payload(struct snp_msg_desc *mdesc, struct snp_guest_r
 	struct snp_guest_msg *req_msg = &mdesc->secret_request;
 	struct snp_guest_msg_hdr *req_msg_hdr = &req_msg->hdr;
 	struct snp_guest_msg_hdr *resp_msg_hdr = &resp_msg->hdr;
-	struct aes_gcm_key *gcm_key = mdesc->gcm_key;
+	const struct aes_gcm_key *gcm_key = &mdesc->gcm_key;
 	u8 iv[GCM_AES_IV_SIZE] = {};
 
 	pr_debug("response [seqno %lld type %d version %d sz %d]\n",
@@ -1746,7 +1731,7 @@ static int enc_payload(struct snp_msg_desc *mdesc, u64 seqno, struct snp_guest_r
 {
 	struct snp_guest_msg *msg = &mdesc->secret_request;
 	struct snp_guest_msg_hdr *hdr = &msg->hdr;
-	struct aes_gcm_key *gcm_key = mdesc->gcm_key;
+	const struct aes_gcm_key *gcm_key = &mdesc->gcm_key;
 	u8 iv[GCM_AES_IV_SIZE] = {};
 
 	memset(msg, 0, sizeof(*msg));

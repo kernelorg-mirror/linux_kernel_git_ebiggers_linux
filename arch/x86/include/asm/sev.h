@@ -8,6 +8,7 @@
 #ifndef __ASM_ENCRYPTED_STATE_H
 #define __ASM_ENCRYPTED_STATE_H
 
+#include <crypto/aes-gcm.h>
 #include <linux/types.h>
 #include <linux/sev-guest.h>
 
@@ -314,7 +315,7 @@ struct snp_msg_desc {
 
 	struct snp_secrets_page *secrets;
 
-	struct aes_gcm_key *gcm_key;
+	struct aes_gcm_key gcm_key;
 
 	u32 *os_area_msg_seqno;
 	u8 *vmpck;
