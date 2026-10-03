@@ -20,6 +20,8 @@ static_assert(offsetof(struct aes_key, len) == 0);
 static_assert(offsetof(struct aes_key, nrounds) == 4);
 static_assert(offsetof(struct aes_key, k.rndkeys) == 16);
 static_assert(offsetof(struct aes_key, inv_k.inv_rndkeys) == 256);
+static_assert(offsetof(struct aes_xts_key, main_key) == 0);
+static_assert(offsetof(struct aes_xts_key, tweak_key.k.rndkeys) == 512);
 
 void aes128_expandkey_aesni(u32 rndkeys[], u32 *inv_rndkeys,
 			    const u8 in_key[AES_KEYSIZE_128]);
@@ -313,26 +315,24 @@ void aes_xts_encrypt_aesni(u8 *dst, const u8 *src, long nblocks,
 			   u8 tweak[AES_BLOCK_SIZE], const struct aes_key *key);
 void aes_xts_decrypt_aesni(u8 *dst, const u8 *src, long nblocks,
 			   u8 tweak[AES_BLOCK_SIZE], const struct aes_key *key);
-void aes_xts_encrypt_iv(const struct aes_enckey *tweak_key,
-			u8 iv[AES_BLOCK_SIZE]);
 void aes_xts_encrypt_aesni_avx(u8 *dst, const u8 *src, long nblocks,
 			       u8 tweak[AES_BLOCK_SIZE],
-			       const struct aes_key *key);
+			       const struct aes_xts_key *key, bool cont);
 void aes_xts_decrypt_aesni_avx(u8 *dst, const u8 *src, long nblocks,
 			       u8 tweak[AES_BLOCK_SIZE],
-			       const struct aes_key *key);
+			       const struct aes_xts_key *key, bool cont);
 void aes_xts_encrypt_vaes_avx2(u8 *dst, const u8 *src, long nblocks,
 			       u8 tweak[AES_BLOCK_SIZE],
-			       const struct aes_key *key);
+			       const struct aes_xts_key *key, bool cont);
 void aes_xts_decrypt_vaes_avx2(u8 *dst, const u8 *src, long nblocks,
 			       u8 tweak[AES_BLOCK_SIZE],
-			       const struct aes_key *key);
+			       const struct aes_xts_key *key, bool cont);
 void aes_xts_encrypt_vaes_avx512(u8 *dst, const u8 *src, long nblocks,
 				 u8 tweak[AES_BLOCK_SIZE],
-				 const struct aes_key *key);
+				 const struct aes_xts_key *key, bool cont);
 void aes_xts_decrypt_vaes_avx512(u8 *dst, const u8 *src, long nblocks,
 				 u8 tweak[AES_BLOCK_SIZE],
-				 const struct aes_key *key);
+				 const struct aes_xts_key *key, bool cont);
 
 /* len is always a positive multiple of AES_BLOCK_SIZE here. */
 static __always_inline bool
@@ -347,34 +347,28 @@ aes_xts_crypt_x86(u8 *dst, const u8 *src, size_t len, u8 tweak[AES_BLOCK_SIZE],
 	kernel_fpu_begin();
 	if (IS_ENABLED(CONFIG_X86_64) &&
 	    static_branch_likely(&have_vaes_avx512)) {
-		if (!cont)
-			aes_xts_encrypt_iv(&key->tweak_key, tweak);
 		if (enc)
 			aes_xts_encrypt_vaes_avx512(dst, src, nblocks, tweak,
-						    &key->main_key);
+						    key, cont);
 		else
 			aes_xts_decrypt_vaes_avx512(dst, src, nblocks, tweak,
-						    &key->main_key);
+						    key, cont);
 	} else if (IS_ENABLED(CONFIG_X86_64) &&
 		   static_branch_likely(&have_vaes_avx2)) {
-		if (!cont)
-			aes_xts_encrypt_iv(&key->tweak_key, tweak);
 		if (enc)
 			aes_xts_encrypt_vaes_avx2(dst, src, nblocks, tweak,
-						  &key->main_key);
+						  key, cont);
 		else
 			aes_xts_decrypt_vaes_avx2(dst, src, nblocks, tweak,
-						  &key->main_key);
+						  key, cont);
 	} else if (IS_ENABLED(CONFIG_X86_64) &&
 		   static_branch_likely(&have_aesni_avx)) {
-		if (!cont)
-			aes_xts_encrypt_iv(&key->tweak_key, tweak);
 		if (enc)
 			aes_xts_encrypt_aesni_avx(dst, src, nblocks, tweak,
-						  &key->main_key);
+						  key, cont);
 		else
 			aes_xts_decrypt_aesni_avx(dst, src, nblocks, tweak,
-						  &key->main_key);
+						  key, cont);
 	} else {
 		if (!cont)
 			aes_encrypt_aesni(tweak, tweak, &key->tweak_key);

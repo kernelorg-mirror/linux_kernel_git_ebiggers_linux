@@ -87,10 +87,11 @@
 
 #include <linux/linkage.h>
 
-// Offsets in struct aes_key
+// Offsets in struct aes_xts_key
 #define OFFSETOF_KEYLEN		0
 #define OFFSETOF_RNDKEYS	16
 #define OFFSETOF_INVRNDKEYS	256
+#define OFFSETOF_TWEAK_RNDKEYS	512
 
 .section .rodata
 .p2align 4
@@ -147,14 +148,19 @@
 	.set	NBLOCKS,	%rdx	// Number of blocks remaining
 	.set	NBLOCKS32,	%edx	// Used for improved code density
 	.set	TWEAK,		%rcx	// Pointer to next tweak
-	.set	KEY,		%r8	// Initially points to struct aes_key, then is
-					// advanced to point to 7th-from-last round key
+	.set	KEY,		%r8	// Initially points to
+					// struct aes_xts_key, then is
+					// advanced to point to the
+					// 7th-from-last round key (or inverse
+					// round key) of the main key.
+	.set	CONT,		%r9b	// true if tweak already encrypted by
+					// tweak key, otherwise false
 
 	// %rax holds the AES key length in bytes.
 	.set	KEYLEN,		%eax
 	.set	KEYLEN64,	%rax
 
-	// %r9-r11 are available as temporaries.
+	// %r10-r11 are available as temporaries.
 
 	// V0-V3 hold the data blocks during the main loop, or temporary values
 	// otherwise.  V4-V5 hold temporary values.
@@ -294,17 +300,15 @@
 .endif
 .endm
 
-// Given the first XTS tweak at (TWEAK), compute the first set of tweaks and
+// Given the first XTS tweak in TWEAK0_XMM, compute the first set of tweaks and
 // store them in the vector registers TWEAK0-TWEAK3.  Clobbers V0-V5.
 .macro	_compute_first_set_of_tweaks
 .if VL == 16
-	vmovdqu		(TWEAK), TWEAK0_XMM
 	vmovdqu		.Lgf_poly(%rip), GF_POLY
 	_next_tweak	TWEAK0, %xmm0, TWEAK1
 	_next_tweak	TWEAK1, %xmm0, TWEAK2
 	_next_tweak	TWEAK2, %xmm0, TWEAK3
 .elseif VL == 32
-	vmovdqu		(TWEAK), TWEAK0_XMM
 	vbroadcasti128	.Lgf_poly(%rip), GF_POLY
 
 	// Compute the first vector of tweaks.
@@ -334,7 +338,7 @@
 	vpxor		V3, TWEAK2, TWEAK2
 	vpxor		V5, TWEAK3, TWEAK3
 .else
-	vbroadcasti32x4	(TWEAK), TWEAK0
+	vshufi64x2	$0, TWEAK0, TWEAK0, TWEAK0
 	vbroadcasti32x4	.Lgf_poly(%rip), GF_POLY
 
 	// Compute the first vector of tweaks:
@@ -456,16 +460,39 @@
 .endif
 .endm
 
-.macro	_setup_round_keys	enc
+.macro _setup_rndkey_and_maybe_encrypt_tweak_step	i, encrypt_tweak
+.if \encrypt_tweak
+  .if \i < 14
+	vaesenc		(\i-7)*16(TWEAK_KEY), TWEAK0_XMM, TWEAK0_XMM
+  .else
+	vaesenclast	(\i-7)*16(TWEAK_KEY), TWEAK0_XMM, TWEAK0_XMM
+  .endif
+.endif
+.if USE_AVX512
+	vbroadcasti32x4	(\i-7)*16(KEY), KEY\i
+.endif
+.endm
 
-	// Select either the encryption round keys or the decryption round keys.
+.macro	_setup_rndkeys_and_maybe_encrypt_tweak	enc, encrypt_tweak
+
+	// Select either the encryption round keys or the decryption round keys,
+	// depending on \enc which gives the direction of the AES-XTS operation.
 .if \enc
 	.set	OFFS, OFFSETOF_RNDKEYS
 .else
 	.set	OFFS, OFFSETOF_INVRNDKEYS
 .endif
 
-	// Load the round key for "round 0".
+.if \encrypt_tweak
+	// Do the zero-th round of tweak encryption.  Then set up the pointer to
+	// the 7th-from-last tweak round key; this uses the same trick that is
+	// used for the main round keys, described in detail below.
+	vpxor	OFFSETOF_TWEAK_RNDKEYS(KEY), TWEAK0_XMM, TWEAK0_XMM
+	.set	TWEAK_KEY, %r10
+	lea	OFFSETOF_TWEAK_RNDKEYS-16(KEY, KEYLEN64, 4), TWEAK_KEY
+.endif
+
+	// Load the main round key for "round 0".
 	_vbroadcast128	OFFS(KEY), KEY0
 
 	// Increment KEY to make it so that 7*16(KEY) is the last round key.
@@ -491,26 +518,19 @@
 	lea		OFFS-16(KEY, KEYLEN64, 4), KEY
 
 	// If all 32 SIMD registers are available, cache all the round keys.
-.if USE_AVX512
+.if USE_AVX512 || \encrypt_tweak
 	cmp		$24, KEYLEN
 	jl		.Laes128\@
 	je		.Laes192\@
-	vbroadcasti32x4	-6*16(KEY), KEY1
-	vbroadcasti32x4	-5*16(KEY), KEY2
+	_setup_rndkey_and_maybe_encrypt_tweak_step	1, \encrypt_tweak
+	_setup_rndkey_and_maybe_encrypt_tweak_step	2, \encrypt_tweak
 .Laes192\@:
-	vbroadcasti32x4	-4*16(KEY), KEY3
-	vbroadcasti32x4	-3*16(KEY), KEY4
+	_setup_rndkey_and_maybe_encrypt_tweak_step	3, \encrypt_tweak
+	_setup_rndkey_and_maybe_encrypt_tweak_step	4, \encrypt_tweak
 .Laes128\@:
-	vbroadcasti32x4	-2*16(KEY), KEY5
-	vbroadcasti32x4	-1*16(KEY), KEY6
-	vbroadcasti32x4	0*16(KEY), KEY7
-	vbroadcasti32x4	1*16(KEY), KEY8
-	vbroadcasti32x4	2*16(KEY), KEY9
-	vbroadcasti32x4	3*16(KEY), KEY10
-	vbroadcasti32x4	4*16(KEY), KEY11
-	vbroadcasti32x4	5*16(KEY), KEY12
-	vbroadcasti32x4	6*16(KEY), KEY13
-	vbroadcasti32x4	7*16(KEY), KEY14
+  .irp i, 5,6,7,8,9,10,11,12,13,14
+	_setup_rndkey_and_maybe_encrypt_tweak_step	\i, \encrypt_tweak
+  .endr
 .endif
 .endm
 
@@ -610,9 +630,17 @@
 	// Load the AES key length: 16 (AES-128), 24 (AES-192), or 32 (AES-256).
 	movl		OFFSETOF_KEYLEN(KEY), KEYLEN
 
-	// Setup the pointer to the round keys and cache as many as possible.
-	_setup_round_keys	\enc
+	// Load the tweak.
+	vmovdqu		(TWEAK), TWEAK0_XMM
 
+
+	// Encrypt TWEAK if cont=false.  While doing that, set up the pointer to
+	// the main round keys and cache as many as possible.
+	test		CONT, CONT
+	jnz		.Lxts_continue\@
+	_setup_rndkeys_and_maybe_encrypt_tweak	\enc, 1
+
+.Lcompute_first_set_of_tweaks\@:
 	// Compute the first set of tweaks TWEAK[0-3].
 	_compute_first_set_of_tweaks
 
@@ -712,6 +740,10 @@
 .endif
 	RET
 
+.Lxts_continue\@:
+	_setup_rndkeys_and_maybe_encrypt_tweak	\enc, 0
+	jmp		.Lcompute_first_set_of_tweaks\@
+
 .Lhandle_remainder\@:
 
 	// En/decrypt any remaining blocks, one vector at a time.
@@ -747,48 +779,13 @@
 	jmp		.Ldone\@
 .endm
 
-// void aes_xts_encrypt_iv(const struct aes_enckey *tweak_key,
-//			   u8 iv[AES_BLOCK_SIZE]);
-//
-// Encrypt |iv| using the AES key |tweak_key| to get the first tweak.  Assumes
-// that the CPU supports AES-NI and AVX, but not necessarily VAES or AVX512.
-SYM_FUNC_START(aes_xts_encrypt_iv)
-	.set	TWEAK_KEY,	%rdi
-	.set	IV,		%rsi
-	.set	KEYLEN,		%eax
-	.set	KEYLEN64,	%rax
-
-	vmovdqu		(IV), %xmm0
-	vpxor		OFFSETOF_RNDKEYS(TWEAK_KEY), %xmm0, %xmm0
-	movl		OFFSETOF_KEYLEN(TWEAK_KEY), KEYLEN
-	lea		OFFSETOF_RNDKEYS-16(TWEAK_KEY, KEYLEN64, 4), TWEAK_KEY
-	cmp		$24, KEYLEN
-	jl		.Lencrypt_iv_aes128
-	je		.Lencrypt_iv_aes192
-	vaesenc		-6*16(TWEAK_KEY), %xmm0, %xmm0
-	vaesenc		-5*16(TWEAK_KEY), %xmm0, %xmm0
-.Lencrypt_iv_aes192:
-	vaesenc		-4*16(TWEAK_KEY), %xmm0, %xmm0
-	vaesenc		-3*16(TWEAK_KEY), %xmm0, %xmm0
-.Lencrypt_iv_aes128:
-.irp i, -2,-1,0,1,2,3,4,5,6
-	vaesenc		\i*16(TWEAK_KEY), %xmm0, %xmm0
-.endr
-	vaesenclast	7*16(TWEAK_KEY), %xmm0, %xmm0
-	vmovdqu		%xmm0, (IV)
-	RET
-SYM_FUNC_END(aes_xts_encrypt_iv)
-
 // Below are the actual AES-XTS encryption and decryption functions,
 // instantiated from the above macro.  They all have the following prototype:
 //
 // void aes_xts_{en,de}crypt_{cpufeature}(u8 *dst, const u8 *src, long nblocks,
 //					  u8 tweak[AES_BLOCK_SIZE],
-//					  const struct aes_key *key);
-//
-// `tweak` must have already been encrypted by the tweak key; `key` is just the
-// main key.  `tweak` is updated to contain the next tweak, allowing for
-// incremental computation.
+//					  const struct aes_xts_key *key,
+//					  bool cont);
 
 .set	VL, 16
 .set	USE_AVX512, 0
