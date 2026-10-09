@@ -258,6 +258,19 @@ config CRYPTO_BENCHMARK
 	  algorithms in the kernel.  It should not be enabled in production
 	  kernels.
 
+config CRYPTO_BENCHMARK2
+	tristate
+	depends on CRYPTO
+	select CRYPTO_AEAD
+	select CRYPTO_HASH
+	select CRYPTO_SKCIPHER
+	select CRYPTO_LIB_SHA256
+	default y
+	help
+	  This module exposes a file /proc/cryptobench.  Writing
+	  commands to this file triggers benchmarking and testing of
+	  crypto algorithms.
+
 config CRYPTO_SIMD
 	tristate
 	select CRYPTO_AEAD
