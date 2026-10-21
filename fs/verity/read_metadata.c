@@ -170,8 +170,9 @@ int fsverity_ioctl_read_metadata(struct file *filp, const void __user *uarg)
 	if (!vi)
 		return -ENODATA; /* not a verity file */
 	/*
-	 * Note that we don't have to explicitly check that the file is open for
-	 * reading, since verity files can only be opened for reading.
+	 * No need to check for FMODE_READ.  Verity files can't be open for
+	 * writing, and opening with access mode 3 (ioctl-only) requires read
+	 * (and write) permission, so the opener has read permission either way.
 	 */
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
