@@ -34,7 +34,7 @@ static void raid6_avx5121_gen_syndrome(int disks, size_t bytes, void **ptrs)
 	p = dptr[z0+1];         /* XOR parity */
 	q = dptr[z0+2];         /* RS syndrome */
 
-	kernel_fpu_begin();
+	kernel_fpu_begin_mask(0);
 
 	asm volatile("vmovdqa64 %0,%%zmm0\n\t"
 		     "vpxorq %%zmm1,%%zmm1,%%zmm1" /* Zero temp */
@@ -92,7 +92,7 @@ static void raid6_avx5121_xor_syndrome(int disks, int start, int stop,
 	p = dptr[disks-2];	/* XOR parity */
 	q = dptr[disks-1];	/* RS syndrome */
 
-	kernel_fpu_begin();
+	kernel_fpu_begin_mask(0);
 
 	asm volatile("vmovdqa64 %0,%%zmm0"
 		     : : "m" (raid6_avx512_constants.x1d[0]));
@@ -159,7 +159,7 @@ static void raid6_avx5122_gen_syndrome(int disks, size_t bytes, void **ptrs)
 	p = dptr[z0+1];         /* XOR parity */
 	q = dptr[z0+2];         /* RS syndrome */
 
-	kernel_fpu_begin();
+	kernel_fpu_begin_mask(0);
 
 	asm volatile("vmovdqa64 %0,%%zmm0\n\t"
 		     "vpxorq %%zmm1,%%zmm1,%%zmm1" /* Zero temp */
@@ -222,7 +222,7 @@ static void raid6_avx5122_xor_syndrome(int disks, int start, int stop,
 	p = dptr[disks-2];	/* XOR parity */
 	q = dptr[disks-1];	/* RS syndrome */
 
-	kernel_fpu_begin();
+	kernel_fpu_begin_mask(0);
 
 	asm volatile("vmovdqa64 %0,%%zmm0"
 		     : : "m" (raid6_avx512_constants.x1d[0]));
@@ -316,7 +316,7 @@ static void raid6_avx5124_gen_syndrome(int disks, size_t bytes, void **ptrs)
 	p = dptr[z0+1];         /* XOR parity */
 	q = dptr[z0+2];         /* RS syndrome */
 
-	kernel_fpu_begin();
+	kernel_fpu_begin_mask(0);
 
 	asm volatile("vmovdqa64 %0,%%zmm0\n\t"
 		     "vpxorq %%zmm1,%%zmm1,%%zmm1\n\t"       /* Zero temp */
@@ -410,7 +410,7 @@ static void raid6_avx5124_xor_syndrome(int disks, int start, int stop,
 	p = dptr[disks-2];	/* XOR parity */
 	q = dptr[disks-1];	/* RS syndrome */
 
-	kernel_fpu_begin();
+	kernel_fpu_begin_mask(0);
 
 	asm volatile("vmovdqa64 %0,%%zmm0"
 		     :: "m" (raid6_avx512_constants.x1d[0]));
