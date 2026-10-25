@@ -868,6 +868,13 @@ void __init fpu__init_system_xstate(unsigned int legacy_size)
 		setup_clear_cpu_cap(X86_FEATURE_APX);
 	}
 
+	if (boot_cpu_has(X86_FEATURE_SHSTK) &&
+	    !(fpu_kernel_cfg.max_features & XFEATURE_MASK_CET_USER)) {
+		pr_err(FW_BUG
+		       "x86/fpu: Disabling SHSTK support due to missing xstate feature\n");
+		setup_clear_cpu_cap(X86_FEATURE_SHSTK);
+	}
+
 	if (fpu_kernel_cfg.max_features & XFEATURE_MASK_APX &&
 	    fpu_kernel_cfg.max_features & (XFEATURE_MASK_BNDREGS | XFEATURE_MASK_BNDCSR)) {
 		/*
