@@ -6249,8 +6249,7 @@ static inline void __intel_update_pmu_xregs_caps(struct pmu *pmu)
 	if (!boot_cpu_has(X86_FEATURE_XSAVES))
 		return;
 
-	if (!boot_cpu_has(X86_FEATURE_XMM) ||
-	    !cpu_has_xfeatures(XFEATURE_MASK_SSE, NULL))
+	if (!boot_cpu_has(X86_FEATURE_XMM))
 		return;
 
 	/*
@@ -6260,22 +6259,16 @@ static inline void __intel_update_pmu_xregs_caps(struct pmu *pmu)
 	 */
 	x86_pmu.ext_regs_mask |= XFEATURE_MASK_SSE;
 
-	if (boot_cpu_has(X86_FEATURE_AVX) &&
-	    cpu_has_xfeatures(XFEATURE_MASK_YMM, NULL))
+	if (boot_cpu_has(X86_FEATURE_AVX))
 		x86_pmu.ext_regs_mask |= XFEATURE_MASK_YMM;
-	if (boot_cpu_has(X86_FEATURE_APX) &&
-	    cpu_has_xfeatures(XFEATURE_MASK_APX, NULL))
+	if (boot_cpu_has(X86_FEATURE_APX))
 		x86_pmu.ext_regs_mask |= XFEATURE_MASK_APX;
 	if (boot_cpu_has(X86_FEATURE_AVX512F)) {
-		if (cpu_has_xfeatures(XFEATURE_MASK_OPMASK, NULL))
-			x86_pmu.ext_regs_mask |= XFEATURE_MASK_OPMASK;
-		if (cpu_has_xfeatures(XFEATURE_MASK_ZMM_Hi256, NULL))
-			x86_pmu.ext_regs_mask |= XFEATURE_MASK_ZMM_Hi256;
-		if (cpu_has_xfeatures(XFEATURE_MASK_Hi16_ZMM, NULL))
-			x86_pmu.ext_regs_mask |= XFEATURE_MASK_Hi16_ZMM;
+		x86_pmu.ext_regs_mask |= XFEATURE_MASK_OPMASK;
+		x86_pmu.ext_regs_mask |= XFEATURE_MASK_ZMM_Hi256;
+		x86_pmu.ext_regs_mask |= XFEATURE_MASK_Hi16_ZMM;
 	}
-	if (cpu_feature_enabled(X86_FEATURE_USER_SHSTK) &&
-	    cpu_has_xfeatures(XFEATURE_MASK_CET_USER, NULL))
+	if (cpu_feature_enabled(X86_FEATURE_USER_SHSTK))
 		x86_pmu.ext_regs_mask |= XFEATURE_MASK_CET_USER;
 
 	dest_pmu->capabilities |= PERF_PMU_CAP_EXTENDED_REGS;
