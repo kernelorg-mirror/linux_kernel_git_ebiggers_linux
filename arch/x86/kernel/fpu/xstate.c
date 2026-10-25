@@ -861,6 +861,13 @@ void __init fpu__init_system_xstate(unsigned int legacy_size)
 		}
 	}
 
+	if (boot_cpu_has(X86_FEATURE_APX) &&
+	    !(fpu_kernel_cfg.max_features & XFEATURE_MASK_APX)) {
+		pr_err(FW_BUG
+		       "x86/fpu: Disabling APX support due to missing xstate feature\n");
+		setup_clear_cpu_cap(X86_FEATURE_APX);
+	}
+
 	if (fpu_kernel_cfg.max_features & XFEATURE_MASK_APX &&
 	    fpu_kernel_cfg.max_features & (XFEATURE_MASK_BNDREGS | XFEATURE_MASK_BNDCSR)) {
 		/*
