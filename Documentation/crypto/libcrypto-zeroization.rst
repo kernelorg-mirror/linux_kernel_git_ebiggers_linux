@@ -43,6 +43,11 @@ two purposes:
 What to zeroize
 ---------------
 
+Raw key material (e.g. a plain AES key stored in an array or a caller-
+defined struct) must also be zeroized as soon as it is no longer needed,
+for example right after it has been used to populate one of the key
+structures below.
+
 The following types of structures hold sensitive material and should be
 zeroized after use:
 
