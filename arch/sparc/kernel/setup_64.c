@@ -32,6 +32,7 @@
 #include <linux/module.h>
 #include <linux/start_kernel.h>
 #include <linux/memblock.h>
+#include <linux/of.h>
 #include <uapi/linux/mount.h>
 
 #include <asm/io.h>
@@ -466,25 +467,9 @@ static void __init report_hwcaps(unsigned long caps)
 		printk(KERN_CONT "]\n");
 }
 
-static unsigned long __init mdesc_cpu_hwcap_list(void)
+static unsigned long __init hwcap_list_caps(const char *prop, int len)
 {
-	struct mdesc_handle *hp;
 	unsigned long caps = 0;
-	const char *prop;
-	int len;
-	u64 pn;
-
-	hp = mdesc_grab();
-	if (!hp)
-		return 0;
-
-	pn = mdesc_node_by_name(hp, MDESC_NODE_NULL, "cpu");
-	if (pn == MDESC_NODE_NULL)
-		goto out;
-
-	prop = mdesc_get_property(hp, pn, "hwcap-list", &len);
-	if (!prop)
-		goto out;
 
 	while (len) {
 		int i, plen;
@@ -507,8 +492,50 @@ static unsigned long __init mdesc_cpu_hwcap_list(void)
 		len -= plen;
 	}
 
+	return caps;
+}
+
+static unsigned long __init mdesc_cpu_hwcap_list(void)
+{
+	struct mdesc_handle *hp;
+	unsigned long caps = 0;
+	const char *prop;
+	int len;
+	u64 pn;
+
+	hp = mdesc_grab();
+	if (!hp)
+		return 0;
+
+	pn = mdesc_node_by_name(hp, MDESC_NODE_NULL, "cpu");
+	if (pn == MDESC_NODE_NULL)
+		goto out;
+
+	prop = mdesc_get_property(hp, pn, "hwcap-list", &len);
+	if (prop)
+		caps = hwcap_list_caps(prop, len);
+
 out:
 	mdesc_release(hp);
+	return caps;
+}
+
+/* sun4u has no machine description; QEMU lists the caps here. */
+static unsigned long __init of_cpu_hwcap_list(void)
+{
+	struct device_node *dp;
+	unsigned long caps = 0;
+	const char *prop;
+	int len;
+
+	dp = of_find_node_by_type(NULL, "cpu");
+	if (!dp)
+		return 0;
+
+	prop = of_get_property(dp, "qemu,hwcap-list", &len);
+	if (prop)
+		caps = hwcap_list_caps(prop, len);
+	of_node_put(dp);
 	return caps;
 }
 
@@ -549,6 +576,8 @@ static void __init init_sparc64_elf_hwcap(void)
 	cap |= (AV_SPARC_MUL32 | AV_SPARC_DIV32 | AV_SPARC_V8PLUS);
 
 	mdesc_caps = mdesc_cpu_hwcap_list();
+	if (!mdesc_caps)
+		mdesc_caps = of_cpu_hwcap_list();
 	if (!mdesc_caps) {
 		if (tlb_type == spitfire)
 			cap |= AV_SPARC_VIS;
