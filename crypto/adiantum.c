@@ -60,9 +60,15 @@ struct adiantum_instance_ctx {
 struct adiantum_tfm_ctx {
 	struct crypto_skcipher *streamcipher;
 	struct crypto_cipher *blockcipher;
-	struct poly1305_core_key header_hash_key;
-	struct poly1305_core_key msg_poly_key;
-	u32 nh_key[NH_KEY_WORDS];
+	union {
+		struct {
+			struct poly1305_core_key header_hash_key;
+			struct poly1305_core_key msg_poly_key;
+			u32 nh_key[NH_KEY_WORDS];
+		};
+		/* Used only during adiantum_setkey() */
+		u8 derived_keys[BLOCKCIPHER_KEY_SIZE + HASH_KEY_SIZE];
+	};
 };
 
 struct nhpoly1305_ctx {
@@ -106,14 +112,11 @@ static int adiantum_setkey(struct crypto_skcipher *tfm, const u8 *key,
 			   unsigned int keylen)
 {
 	struct adiantum_tfm_ctx *tctx = crypto_skcipher_ctx(tfm);
-	struct {
-		u8 iv[XCHACHA_IV_SIZE];
-		u8 derived_keys[BLOCKCIPHER_KEY_SIZE + HASH_KEY_SIZE];
-		struct scatterlist sg;
-		struct crypto_wait wait;
-		struct skcipher_request req; /* must be last */
-	} *data;
-	u8 *keyp;
+	SYNC_SKCIPHER_REQUEST_ON_STACK(
+		req, (struct crypto_sync_skcipher *)tctx->streamcipher);
+	u8 poly_keys[2 * POLY1305_BLOCK_SIZE];
+	u8 iv[XCHACHA_IV_SIZE] = { 1 };
+	struct scatterlist sg;
 	int err;
 
 	/* Set the stream cipher key (K_S) */
@@ -126,46 +129,42 @@ static int adiantum_setkey(struct crypto_skcipher *tfm, const u8 *key,
 		return err;
 
 	/* Derive the subkeys */
-	data = kzalloc(sizeof(*data) +
-		       crypto_skcipher_reqsize(tctx->streamcipher), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
-	data->iv[0] = 1;
-	sg_init_one(&data->sg, data->derived_keys, sizeof(data->derived_keys));
-	crypto_init_wait(&data->wait);
-	skcipher_request_set_tfm(&data->req, tctx->streamcipher);
-	skcipher_request_set_callback(&data->req, CRYPTO_TFM_REQ_MAY_SLEEP |
-						  CRYPTO_TFM_REQ_MAY_BACKLOG,
-				      crypto_req_done, &data->wait);
-	skcipher_request_set_crypt(&data->req, &data->sg, &data->sg,
-				   sizeof(data->derived_keys), data->iv);
-	err = crypto_wait_req(crypto_skcipher_encrypt(&data->req), &data->wait);
+	memset(tctx->derived_keys, 0, sizeof(tctx->derived_keys));
+	sg_init_one(&sg, tctx->derived_keys, sizeof(tctx->derived_keys));
+	skcipher_request_set_callback(req, 0, NULL, NULL);
+	skcipher_request_set_crypt(req, &sg, &sg, sizeof(tctx->derived_keys),
+				   iv);
+	err = crypto_skcipher_encrypt(req);
 	if (err)
 		goto out;
-	keyp = data->derived_keys;
 
 	/* Set the block cipher key (K_E) */
 	crypto_cipher_clear_flags(tctx->blockcipher, CRYPTO_TFM_REQ_MASK);
 	crypto_cipher_set_flags(tctx->blockcipher,
 				crypto_skcipher_get_flags(tfm) &
 				CRYPTO_TFM_REQ_MASK);
-	err = crypto_cipher_setkey(tctx->blockcipher, keyp,
+	err = crypto_cipher_setkey(tctx->blockcipher, tctx->derived_keys,
 				   BLOCKCIPHER_KEY_SIZE);
 	if (err)
 		goto out;
-	keyp += BLOCKCIPHER_KEY_SIZE;
 
 	/* Set the hash key (K_H) */
-	poly1305_core_setkey(&tctx->header_hash_key, keyp);
-	keyp += POLY1305_BLOCK_SIZE;
-	poly1305_core_setkey(&tctx->msg_poly_key, keyp);
-	keyp += POLY1305_BLOCK_SIZE;
-	for (int i = 0; i < NH_KEY_WORDS; i++)
-		tctx->nh_key[i] = get_unaligned_le32(&keyp[i * 4]);
-	keyp += NH_KEY_BYTES;
-	WARN_ON(keyp != &data->derived_keys[ARRAY_SIZE(data->derived_keys)]);
+	memcpy(poly_keys, &tctx->derived_keys[BLOCKCIPHER_KEY_SIZE],
+	       2 * POLY1305_BLOCK_SIZE);
+	memmove(tctx->nh_key,
+		&tctx->derived_keys[BLOCKCIPHER_KEY_SIZE +
+				    2 * POLY1305_BLOCK_SIZE],
+		NH_KEY_BYTES);
+	poly1305_core_setkey(&tctx->header_hash_key, &poly_keys[0]);
+	poly1305_core_setkey(&tctx->msg_poly_key,
+			     &poly_keys[POLY1305_BLOCK_SIZE]);
+	le32_to_cpu_array(tctx->nh_key, NH_KEY_WORDS);
+	memzero_explicit(poly_keys, sizeof(poly_keys));
 out:
-	kfree_sensitive(data);
+	if (err)
+		memzero_explicit(tctx->derived_keys,
+				 sizeof(tctx->derived_keys));
+	skcipher_request_zero(req);
 	return err;
 }
 
@@ -506,6 +505,11 @@ static int adiantum_init_tfm(struct crypto_skcipher *tfm)
 	streamcipher = crypto_spawn_skcipher(&ictx->streamcipher_spawn);
 	if (IS_ERR(streamcipher))
 		return PTR_ERR(streamcipher);
+	if (WARN_ON(crypto_skcipher_reqsize(streamcipher) >
+		    MAX_SYNC_SKCIPHER_REQSIZE)) {
+		err = -EINVAL;
+		goto err_free_streamcipher;
+	}
 
 	blockcipher = crypto_spawn_cipher(&ictx->blockcipher_spawn);
 	if (IS_ERR(blockcipher)) {
@@ -590,7 +594,8 @@ static int adiantum_create(struct crypto_template *tmpl, struct rtattr **tb)
 	err = crypto_grab_skcipher(&ictx->streamcipher_spawn,
 				   skcipher_crypto_instance(inst),
 				   crypto_attr_alg_name(tb[1]), 0,
-				   mask | CRYPTO_ALG_ASYNC /* sync only */);
+				   mask | CRYPTO_ALG_ASYNC /* sync only */ |
+					   CRYPTO_ALG_SKCIPHER_REQSIZE_LARGE);
 	if (err)
 		goto err_free_inst;
 	streamcipher_alg = crypto_spawn_skcipher_alg_common(&ictx->streamcipher_spawn);
