@@ -9,7 +9,9 @@ static uint32_t crc32table_be[256];
 static uint32_t crc32ctable_le[256];
 
 /**
- * crc32init_le() - allocate and initialize LE table data
+ * crc32init_le_generic() - allocate and initialize LE table data
+ * @polynomial: CRC polynomial to use
+ * @tab: 256-entry table to fill
  *
  * crc is the crc of the byte i; other entries are filled in based on the
  * fact that crctable[i^j] = crctable[i] ^ crctable[j].
