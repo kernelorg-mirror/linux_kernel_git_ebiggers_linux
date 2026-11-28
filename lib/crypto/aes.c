@@ -1483,8 +1483,7 @@ static inline void aes_xts_fips_test(void)
 static bool aes_gcm_encrypt_update_arch(u8 *dst, const u8 *src, size_t len,
 					struct polyval_elem *ghash_acc,
 					const __be32 ctr32[4],
-					const struct aes_enckey *aes_key,
-					const struct ghash_key *ghash_key)
+					const struct aes_gcm_key *key)
 {
 	return false;
 }
@@ -1493,8 +1492,37 @@ static bool aes_gcm_encrypt_update_arch(u8 *dst, const u8 *src, size_t len,
 static bool aes_gcm_decrypt_update_arch(u8 *dst, const u8 *src, size_t len,
 					struct polyval_elem *ghash_acc,
 					const __be32 ctr32[4],
-					const struct aes_enckey *aes_key,
-					const struct ghash_key *ghash_key)
+					const struct aes_gcm_key *key)
+{
+	return false;
+}
+#endif
+
+/*
+ * Hooks for optimized one-shot AES-GCM implementations, overridable by the
+ * architecture.  They are called with ad_len <= AES_GCM_MAX_AD_LEN and
+ * data_len <= AES_GCM_MAX_DATA_LEN.  Both in-place and out-of-place
+ * en/decryption must be supported.  Returning false causes the incremental
+ * implementation to be used instead.
+ *
+ * When aes_gcm_decrypt_arch() returns true, it sets *err to 0 if the
+ * authentication tag is valid or -EBADMSG if it is invalid.  The caller clears
+ * dst on error.
+ */
+#ifndef aes_gcm_encrypt_arch
+static bool aes_gcm_encrypt_arch(u8 *dst, const u8 *src, size_t data_len,
+				 u8 *authtag, const u8 *ad, size_t ad_len,
+				 const u8 nonce[12],
+				 const struct aes_gcm_key *key)
+{
+	return false;
+}
+#endif
+#ifndef aes_gcm_decrypt_arch
+static bool aes_gcm_decrypt_arch(u8 *dst, const u8 *src, size_t data_len,
+				 const u8 *authtag, const u8 *ad, size_t ad_len,
+				 const u8 nonce[12],
+				 const struct aes_gcm_key *key, int *err)
 {
 	return false;
 }
@@ -1598,7 +1626,7 @@ static __always_inline void aes_gcm_crypt_update(struct aes_gcm_ctx *ctx,
 		if (enc) {
 			if (likely(aes_gcm_encrypt_update_arch(
 				    dst, src, n, &ctx->ghash.acc, ctx->ctr32,
-				    &ctx->key->aes, &ctx->key->ghash))) {
+				    ctx->key))) {
 				be32_add_cpu(&ctx->ctr32[3],
 					     n / AES_BLOCK_SIZE);
 			} else {
@@ -1608,7 +1636,7 @@ static __always_inline void aes_gcm_crypt_update(struct aes_gcm_ctx *ctx,
 		} else {
 			if (likely(aes_gcm_decrypt_update_arch(
 				    dst, src, n, &ctx->ghash.acc, ctx->ctr32,
-				    &ctx->key->aes, &ctx->key->ghash))) {
+				    ctx->key))) {
 				be32_add_cpu(&ctx->ctr32[3],
 					     n / AES_BLOCK_SIZE);
 			} else {
@@ -1706,9 +1734,12 @@ out:
 }
 EXPORT_SYMBOL_GPL(aes_gcm_decrypt_final);
 
-void aes_gcm_encrypt(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
-		     const u8 *ad, size_t ad_len, const u8 nonce[12],
-		     const struct aes_gcm_key *key)
+#ifdef aes_gcm_encrypt_arch
+static noinline void aes_gcm_encrypt_fallback(u8 *dst, const u8 *src,
+					      size_t data_len, u8 *authtag,
+					      const u8 *ad, size_t ad_len,
+					      const u8 nonce[12],
+					      const struct aes_gcm_key *key)
 {
 	struct aes_gcm_ctx ctx;
 
@@ -1717,19 +1748,77 @@ void aes_gcm_encrypt(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
 	aes_gcm_encrypt_update(&ctx, dst, src, data_len);
 	aes_gcm_encrypt_final(&ctx, authtag);
 }
+#endif
+
+void aes_gcm_encrypt(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
+		     const u8 *ad, size_t ad_len, const u8 nonce[12],
+		     const struct aes_gcm_key *key)
+{
+	WARN_ON_ONCE(ad_len > AES_GCM_MAX_AD_LEN);
+	WARN_ON_ONCE(data_len > AES_GCM_MAX_DATA_LEN);
+
+#ifdef aes_gcm_encrypt_arch
+	if (likely(aes_gcm_encrypt_arch(dst, src, data_len, authtag, ad, ad_len,
+					nonce, key)))
+		return;
+	aes_gcm_encrypt_fallback(dst, src, data_len, authtag, ad, ad_len, nonce,
+				 key);
+#else
+	struct aes_gcm_ctx ctx;
+
+	aes_gcm_init(&ctx, nonce, key);
+	aes_gcm_auth_update(&ctx, ad, ad_len);
+	aes_gcm_encrypt_update(&ctx, dst, src, data_len);
+	aes_gcm_encrypt_final(&ctx, authtag);
+#endif
+}
 EXPORT_SYMBOL_GPL(aes_gcm_encrypt);
+
+#ifdef aes_gcm_decrypt_arch
+static noinline int aes_gcm_decrypt_fallback(u8 *dst, const u8 *src,
+					     size_t data_len, const u8 *authtag,
+					     const u8 *ad, size_t ad_len,
+					     const u8 nonce[12],
+					     const struct aes_gcm_key *key)
+{
+	struct aes_gcm_ctx ctx;
+
+	aes_gcm_init(&ctx, nonce, key);
+	aes_gcm_auth_update(&ctx, ad, ad_len);
+	aes_gcm_decrypt_update(&ctx, dst, src, data_len);
+	return aes_gcm_decrypt_final(&ctx, authtag);
+}
+#endif
 
 int aes_gcm_decrypt(u8 *dst, const u8 *src, size_t data_len, const u8 *authtag,
 		    const u8 *ad, size_t ad_len, const u8 nonce[12],
 		    const struct aes_gcm_key *key)
 {
-	struct aes_gcm_ctx ctx;
 	int err;
 
-	aes_gcm_init(&ctx, nonce, key);
-	aes_gcm_auth_update(&ctx, ad, ad_len);
-	aes_gcm_decrypt_update(&ctx, dst, src, data_len);
-	err = aes_gcm_decrypt_final(&ctx, authtag);
+	if (WARN_ON_ONCE(ad_len > AES_GCM_MAX_AD_LEN) ||
+	    WARN_ON_ONCE(data_len > AES_GCM_MAX_DATA_LEN)) {
+		err = -EBADMSG;
+		goto out;
+	}
+
+#ifdef aes_gcm_decrypt_arch
+	if (likely(aes_gcm_decrypt_arch(dst, src, data_len, authtag, ad, ad_len,
+					nonce, key, &err)))
+		goto out;
+	err = aes_gcm_decrypt_fallback(dst, src, data_len, authtag, ad, ad_len,
+				       nonce, key);
+#else
+	{
+		struct aes_gcm_ctx ctx;
+
+		aes_gcm_init(&ctx, nonce, key);
+		aes_gcm_auth_update(&ctx, ad, ad_len);
+		aes_gcm_decrypt_update(&ctx, dst, src, data_len);
+		err = aes_gcm_decrypt_final(&ctx, authtag);
+	}
+#endif
+out:
 	if (unlikely(err) && data_len) {
 		/*
 		 * Clear the inauthentic decrypted data so that callers won't
