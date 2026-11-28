@@ -411,8 +411,11 @@ static bool aes_xts_decrypt_arch(u8 *dst, const u8 *src, size_t len,
 #if IS_ENABLED(CONFIG_CRYPTO_LIB_AES_GCM) && IS_ENABLED(CONFIG_X86_64)
 static_assert(offsetof(struct gf128hash_key_x86, h_powers_xored) == 0);
 static_assert(offsetof(struct gf128hash_key_x86, h_powers) == 128);
+static_assert(offsetof(struct gf128hash_key_x86, h_powers16) == 0);
+static_assert(offsetof(struct gf128hash_key_x86, padding) == 256);
 static_assert(offsetof(struct gf128hash_key_x86, h_times_xm64) == 304);
 static_assert(offsetof(struct gf128hash_key_x86, h_powers[7]) == 240);
+static_assert(offsetof(struct gf128hash_key_x86, h_powers16[15]) == 240);
 static_assert(offsetof(struct aes_gcm_key, aes) == 0);
 static_assert(offsetof(struct aes_gcm_key, ghash) == 256);
 static_assert(offsetof(struct aes_gcm_key, authtag_len) == 576);
@@ -423,6 +426,9 @@ void aes_gcm_aad_1block_aesni(const struct aes_gcm_key *key,
 void aes_gcm_aad_1block_aesni_avx(const struct aes_gcm_key *key,
 				  struct polyval_elem *acc, const u8 *ad,
 				  size_t ad_len);
+void aes_gcm_aad_1block_vaes_avx512(const struct aes_gcm_key *key,
+				    struct polyval_elem *acc, const u8 *ad,
+				    size_t ad_len);
 void aes_gcm_enc_update_aesni(u8 *dst, const u8 *src, size_t len,
 			      struct polyval_elem *ghash_acc,
 			      const __be32 ctr32[4],
@@ -447,6 +453,14 @@ void aes_gcm_dec_update_vaes_avx2(u8 *dst, const u8 *src, size_t len,
 				  struct polyval_elem *ghash_acc,
 				  const __be32 ctr32[4],
 				  const struct aes_gcm_key *key);
+void aes_gcm_enc_update_vaes_avx512(u8 *dst, const u8 *src, size_t len,
+				    struct polyval_elem *ghash_acc,
+				    const __be32 ctr32[4],
+				    const struct aes_gcm_key *key);
+void aes_gcm_dec_update_vaes_avx512(u8 *dst, const u8 *src, size_t len,
+				    struct polyval_elem *ghash_acc,
+				    const __be32 ctr32[4],
+				    const struct aes_gcm_key *key);
 void aes_gcm_enc_final_aesni(const struct aes_gcm_key *key,
 			     const struct polyval_elem *ghash_acc,
 			     const u8 nonce[12], u64 ad_len, u64 data_len,
@@ -463,13 +477,28 @@ bool aes_gcm_dec_final_aesni_avx(const struct aes_gcm_key *key,
 				 const struct polyval_elem *ghash_acc,
 				 const u8 nonce[12], u64 ad_len, u64 data_len,
 				 const u8 *authtag);
+void aes_gcm_enc_final_vaes_avx512(const struct aes_gcm_key *key,
+				   const struct polyval_elem *ghash_acc,
+				   const u8 nonce[12], u64 ad_len, u64 data_len,
+				   u8 *authtag);
+bool aes_gcm_dec_final_vaes_avx512(const struct aes_gcm_key *key,
+				   const struct polyval_elem *ghash_acc,
+				   const u8 nonce[12], u64 ad_len, u64 data_len,
+				   const u8 *authtag);
 
 static __always_inline void
 aes_gcm_update_x86_fpu(u8 *dst, const u8 *src, size_t len,
 		       struct polyval_elem *ghash_acc, const __be32 ctr32[4],
 		       const struct aes_gcm_key *key, bool enc)
 {
-	if (static_branch_likely(&have_vaes_avx2)) {
+	if (static_branch_likely(&have_vaes_avx512)) {
+		if (enc)
+			aes_gcm_enc_update_vaes_avx512(dst, src, len, ghash_acc,
+						       ctr32, key);
+		else
+			aes_gcm_dec_update_vaes_avx512(dst, src, len, ghash_acc,
+						       ctr32, key);
+	} else if (static_branch_likely(&have_vaes_avx2)) {
 		if (enc)
 			aes_gcm_enc_update_vaes_avx2(dst, src, len, ghash_acc,
 						     ctr32, key);
@@ -500,7 +529,6 @@ aes_gcm_crypt_update_x86(u8 *dst, const u8 *src, size_t len,
 			 const struct aes_gcm_key *key, bool enc)
 {
 	if (!static_branch_likely(&have_aesni_pclmul) ||
-	    static_branch_likely(&have_vaes_avx512) ||
 	    unlikely(!irq_fpu_usable()))
 		return false;
 
@@ -556,7 +584,6 @@ aes_gcm_crypt_x86(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
 	__be32 ctr32[4];
 
 	if (!static_branch_likely(&have_aesni_pclmul) ||
-	    static_branch_likely(&have_vaes_avx512) ||
 	    unlikely(!irq_fpu_usable()))
 		return false;
 
@@ -573,7 +600,10 @@ aes_gcm_crypt_x86(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
 	kernel_fpu_begin_mask(0);
 
 	if (ad_len && ad_len <= AES_BLOCK_SIZE) {
-		if (static_branch_likely(&have_aesni_avx))
+		if (static_branch_likely(&have_vaes_avx512))
+			aes_gcm_aad_1block_vaes_avx512(key, &ghash_acc, ad,
+						       ad_len);
+		else if (static_branch_likely(&have_aesni_avx))
 			aes_gcm_aad_1block_aesni_avx(key, &ghash_acc, ad,
 						     ad_len);
 		else
@@ -600,7 +630,11 @@ aes_gcm_crypt_x86(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
 	}
 
 	if (enc) {
-		if (static_branch_likely(&have_aesni_avx))
+		if (static_branch_likely(&have_vaes_avx512))
+			aes_gcm_enc_final_vaes_avx512(key, &ghash_acc, nonce,
+						      ad_len, data_len,
+						      authtag);
+		else if (static_branch_likely(&have_aesni_avx))
 			aes_gcm_enc_final_aesni_avx(key, &ghash_acc, nonce,
 						    ad_len, data_len, authtag);
 		else
@@ -609,7 +643,12 @@ aes_gcm_crypt_x86(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
 	} else {
 		bool valid;
 
-		if (static_branch_likely(&have_aesni_avx))
+		if (static_branch_likely(&have_vaes_avx512))
+			valid = aes_gcm_dec_final_vaes_avx512(key, &ghash_acc,
+							      nonce, ad_len,
+							      data_len,
+							      authtag);
+		else if (static_branch_likely(&have_aesni_avx))
 			valid = aes_gcm_dec_final_aesni_avx(key, &ghash_acc,
 							    nonce, ad_len,
 							    data_len, authtag);
