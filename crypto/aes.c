@@ -770,9 +770,68 @@ static void aes_gcm_decrypt_update_helper(u8 *dst, const u8 *src,
 	aes_gcm_decrypt_update(ctx, dst, src, len);
 }
 
-static int crypto_aes_gcm_encrypt_common(struct aead_request *req,
-					 const struct aes_gcm_key *key,
-					 u8 iv[12], unsigned int assoclen)
+/*
+ * Given a scatterlist @sg containing @assoclen bytes of associated data,
+ * @data_len bytes of en/decrypted data, and @tag_len bytes of authentication
+ * tag, check whether each of those regions (when non-empty) is contiguous in
+ * low memory.  Each region may share a scatterlist element with the previous
+ * region or begin in the immediately following scatterlist element.
+ */
+static inline bool
+aead_sg_get_linear(struct scatterlist *sg, unsigned int assoclen,
+		   unsigned int data_len, unsigned int tag_len,
+		   const u8 **ad_out, struct scatterlist **data_sg_out,
+		   unsigned int *data_off_out, struct scatterlist **tag_sg_out,
+		   unsigned int *tag_off_out)
+{
+	unsigned int off = 0;
+
+	if (IS_ENABLED(CONFIG_HIGHMEM))
+		return false;
+
+	if (assoclen) {
+		if (sg->length < assoclen)
+			return false;
+		if (ad_out)
+			*ad_out = sg_virt(sg);
+		off = assoclen;
+	} else if (ad_out) {
+		*ad_out = NULL;
+	}
+
+	if (data_len) {
+		if (off && sg->length == off) {
+			sg = sg_next(sg);
+			off = 0;
+		}
+		if (!sg || sg->length < (u64)off + data_len)
+			return false;
+		*data_sg_out = sg;
+		*data_off_out = off;
+		off += data_len;
+	} else {
+		*data_sg_out = NULL;
+		*data_off_out = 0;
+	}
+
+	if (tag_len) {
+		if (off && sg->length == off) {
+			sg = sg_next(sg);
+			off = 0;
+		}
+		if (!sg || sg->length < (u64)off + tag_len)
+			return false;
+		*tag_sg_out = sg;
+		*tag_off_out = off;
+	}
+
+	return true;
+}
+
+static noinline int
+crypto_aes_gcm_encrypt_nonlinear(struct aead_request *req,
+				 const struct aes_gcm_key *key, u8 iv[12],
+				 unsigned int assoclen)
 {
 	struct aes_gcm_ctx ctx;
 	u8 authtag[16];
@@ -788,20 +847,59 @@ static int crypto_aes_gcm_encrypt_common(struct aead_request *req,
 	return 0;
 }
 
-static int crypto_aes_gcm_decrypt_common(struct aead_request *req,
+static int crypto_aes_gcm_encrypt_common(struct aead_request *req,
 					 const struct aes_gcm_key *key,
 					 u8 iv[12], unsigned int assoclen)
 {
+	struct scatterlist *src_sg, *dst_sg, *tag_sg;
+	unsigned int src_off, dst_off, tag_off;
+	const u8 *ad;
+
+	if (likely(aead_sg_get_linear(req->src, req->assoclen, req->cryptlen, 0,
+				      &ad, &src_sg, &src_off, NULL, NULL) &&
+		   aead_sg_get_linear(req->dst, req->assoclen, req->cryptlen,
+				      key->authtag_len, NULL, &dst_sg, &dst_off,
+				      &tag_sg, &tag_off))) {
+		const u8 *src = src_sg ? sg_virt(src_sg) + src_off : NULL;
+		u8 *dst = dst_sg ? sg_virt(dst_sg) + dst_off : NULL;
+		u8 *tag = sg_virt(tag_sg) + tag_off;
+
+		aes_gcm_encrypt(dst, src, req->cryptlen, tag, ad, assoclen, iv,
+				key);
+		if (ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE) {
+			if (dst_sg == tag_sg) {
+				__scatterwalk_flush_dcache_pages(
+					sg_page(dst_sg),
+					dst_sg->offset + dst_off,
+					req->cryptlen + key->authtag_len);
+			} else {
+				if (dst_sg)
+					__scatterwalk_flush_dcache_pages(
+						sg_page(dst_sg),
+						dst_sg->offset + dst_off,
+						req->cryptlen);
+				__scatterwalk_flush_dcache_pages(
+					sg_page(tag_sg),
+					tag_sg->offset + tag_off,
+					key->authtag_len);
+			}
+		}
+		return 0;
+	}
+	return crypto_aes_gcm_encrypt_nonlinear(req, key, iv, assoclen);
+}
+
+static noinline int
+crypto_aes_gcm_decrypt_nonlinear(struct aead_request *req,
+				 const struct aes_gcm_key *key, u8 iv[12],
+				 unsigned int assoclen, unsigned int data_len)
+{
 	struct aes_gcm_ctx ctx;
-	unsigned int data_len;
 	u8 authtag[16];
 	int err;
 
 	aes_gcm_init(&ctx, iv, key);
 	crypto_aes_gcm_auth_update(&ctx, req->src, assoclen);
-
-	/* crypto_aead_decrypt() already checked cryptlen >= authtag_len. */
-	data_len = req->cryptlen - key->authtag_len;
 	AES_CRYPT_SG(aes_gcm_decrypt_update_helper, req->dst, req->src,
 		     data_len, req->assoclen, &ctx);
 
@@ -810,6 +908,39 @@ static int crypto_aes_gcm_decrypt_common(struct aead_request *req,
 	err = aes_gcm_decrypt_final(&ctx, authtag);
 	memzero_explicit(authtag, sizeof(authtag));
 	return err;
+}
+
+static int crypto_aes_gcm_decrypt_common(struct aead_request *req,
+					 const struct aes_gcm_key *key,
+					 u8 iv[12], unsigned int assoclen)
+{
+	/* crypto_aead_decrypt() already checked cryptlen >= authtag_len. */
+	unsigned int data_len = req->cryptlen - key->authtag_len;
+	struct scatterlist *src_sg, *dst_sg, *tag_sg;
+	unsigned int src_off, dst_off, tag_off;
+	const u8 *ad;
+
+	if (likely(aead_sg_get_linear(req->src, req->assoclen, data_len,
+				      key->authtag_len, &ad, &src_sg, &src_off,
+				      &tag_sg, &tag_off) &&
+		   (!data_len ||
+		    aead_sg_get_linear(req->dst, req->assoclen, data_len, 0,
+				       NULL, &dst_sg, &dst_off, NULL, NULL)))) {
+		const u8 *src = src_sg ? sg_virt(src_sg) + src_off : NULL;
+		const u8 *tag = sg_virt(tag_sg) + tag_off;
+		u8 *dst = data_len ? sg_virt(dst_sg) + dst_off : NULL;
+		int err;
+
+		err = aes_gcm_decrypt(dst, src, data_len, tag, ad, assoclen, iv,
+				      key);
+		if (ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE && data_len)
+			__scatterwalk_flush_dcache_pages(
+				sg_page(dst_sg), dst_sg->offset + dst_off,
+				data_len);
+		return err;
+	}
+	return crypto_aes_gcm_decrypt_nonlinear(req, key, iv, assoclen,
+						data_len);
 }
 
 static __maybe_unused int crypto_aes_gcm_encrypt(struct aead_request *req)
