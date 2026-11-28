@@ -46,39 +46,6 @@ struct aes_gcm_key {
 	u32 rfc4106_nonce;
 };
 
-/* Key struct used by the AES-NI implementations of AES-GCM */
-struct aes_gcm_key_aesni {
-	/*
-	 * Common part of the key.  16-byte alignment is required by the
-	 * assembly code.
-	 */
-	struct aes_gcm_key base __aligned(16);
-
-	/*
-	 * Powers of the hash key H^8 through H^1.  These are 128-bit values.
-	 * They all have an extra factor of x^-1 and are byte-reversed.  16-byte
-	 * alignment is required by the assembly code.
-	 */
-	u64 h_powers[8][2] __aligned(16);
-
-	/*
-	 * h_powers_xored[i] contains the two 64-bit halves of h_powers[i] XOR'd
-	 * together.  It's used for Karatsuba multiplication.  16-byte alignment
-	 * is required by the assembly code.
-	 */
-	u64 h_powers_xored[8] __aligned(16);
-
-	/*
-	 * H^1 times x^64 (and also the usual extra factor of x^-1).  16-byte
-	 * alignment is required by the assembly code.
-	 */
-	u64 h_times_x64[2] __aligned(16);
-};
-#define AES_GCM_KEY_AESNI(key)	\
-	container_of((key), struct aes_gcm_key_aesni, base)
-#define AES_GCM_KEY_AESNI_SIZE	\
-	(sizeof(struct aes_gcm_key_aesni) + (15 & ~(CRYPTO_MINALIGN - 1)))
-
 /* Key struct used by the VAES + AVX2 implementation of AES-GCM */
 struct aes_gcm_key_vaes_avx2 {
 	/*
@@ -142,7 +109,6 @@ struct aes_gcm_key_vaes_avx512 {
  */
 #define FLAG_RFC4106	BIT(0)
 #define FLAG_ENC	BIT(1)
-#define FLAG_AVX	BIT(2)
 #define FLAG_VAES_AVX2	BIT(3)
 #define FLAG_VAES_AVX512 BIT(4)
 
@@ -151,16 +117,10 @@ aes_gcm_key_get(struct crypto_aead *tfm, int flags)
 {
 	if (flags & FLAG_VAES_AVX512)
 		return PTR_ALIGN(crypto_aead_ctx(tfm), 64);
-	else if (flags & FLAG_VAES_AVX2)
-		return PTR_ALIGN(crypto_aead_ctx(tfm), 32);
 	else
-		return PTR_ALIGN(crypto_aead_ctx(tfm), 16);
+		return PTR_ALIGN(crypto_aead_ctx(tfm), 32);
 }
 
-asmlinkage void
-aes_gcm_precompute_aesni(struct aes_gcm_key_aesni *key);
-asmlinkage void
-aes_gcm_precompute_aesni_avx(struct aes_gcm_key_aesni *key);
 asmlinkage void
 aes_gcm_precompute_vaes_avx2(struct aes_gcm_key_vaes_avx2 *key);
 asmlinkage void
@@ -170,20 +130,10 @@ static void aes_gcm_precompute(struct aes_gcm_key *key, int flags)
 {
 	if (flags & FLAG_VAES_AVX512)
 		aes_gcm_precompute_vaes_avx512(AES_GCM_KEY_VAES_AVX512(key));
-	else if (flags & FLAG_VAES_AVX2)
-		aes_gcm_precompute_vaes_avx2(AES_GCM_KEY_VAES_AVX2(key));
-	else if (flags & FLAG_AVX)
-		aes_gcm_precompute_aesni_avx(AES_GCM_KEY_AESNI(key));
 	else
-		aes_gcm_precompute_aesni(AES_GCM_KEY_AESNI(key));
+		aes_gcm_precompute_vaes_avx2(AES_GCM_KEY_VAES_AVX2(key));
 }
 
-asmlinkage void
-aes_gcm_aad_update_aesni(const struct aes_gcm_key_aesni *key,
-			 u8 ghash_acc[16], const u8 *aad, int aadlen);
-asmlinkage void
-aes_gcm_aad_update_aesni_avx(const struct aes_gcm_key_aesni *key,
-			     u8 ghash_acc[16], const u8 *aad, int aadlen);
 asmlinkage void
 aes_gcm_aad_update_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
 			     u8 ghash_acc[16], const u8 *aad, int aadlen);
@@ -197,25 +147,11 @@ static void aes_gcm_aad_update(const struct aes_gcm_key *key, u8 ghash_acc[16],
 	if (flags & FLAG_VAES_AVX512)
 		aes_gcm_aad_update_vaes_avx512(AES_GCM_KEY_VAES_AVX512(key),
 					       ghash_acc, aad, aadlen);
-	else if (flags & FLAG_VAES_AVX2)
+	else
 		aes_gcm_aad_update_vaes_avx2(AES_GCM_KEY_VAES_AVX2(key),
 					     ghash_acc, aad, aadlen);
-	else if (flags & FLAG_AVX)
-		aes_gcm_aad_update_aesni_avx(AES_GCM_KEY_AESNI(key), ghash_acc,
-					     aad, aadlen);
-	else
-		aes_gcm_aad_update_aesni(AES_GCM_KEY_AESNI(key), ghash_acc,
-					 aad, aadlen);
 }
 
-asmlinkage void
-aes_gcm_enc_update_aesni(const struct aes_gcm_key_aesni *key,
-			 const u32 le_ctr[4], u8 ghash_acc[16],
-			 const u8 *src, u8 *dst, int datalen);
-asmlinkage void
-aes_gcm_enc_update_aesni_avx(const struct aes_gcm_key_aesni *key,
-			     const u32 le_ctr[4], u8 ghash_acc[16],
-			     const u8 *src, u8 *dst, int datalen);
 asmlinkage void
 aes_gcm_enc_update_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
 			     const u32 le_ctr[4], u8 ghash_acc[16],
@@ -225,14 +161,6 @@ aes_gcm_enc_update_vaes_avx512(const struct aes_gcm_key_vaes_avx512 *key,
 			       const u32 le_ctr[4], u8 ghash_acc[16],
 			       const u8 *src, u8 *dst, int datalen);
 
-asmlinkage void
-aes_gcm_dec_update_aesni(const struct aes_gcm_key_aesni *key,
-			 const u32 le_ctr[4], u8 ghash_acc[16],
-			 const u8 *src, u8 *dst, int datalen);
-asmlinkage void
-aes_gcm_dec_update_aesni_avx(const struct aes_gcm_key_aesni *key,
-			     const u32 le_ctr[4], u8 ghash_acc[16],
-			     const u8 *src, u8 *dst, int datalen);
 asmlinkage void
 aes_gcm_dec_update_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
 			     const u32 le_ctr[4], u8 ghash_acc[16],
@@ -253,45 +181,22 @@ aes_gcm_update(const struct aes_gcm_key *key,
 			aes_gcm_enc_update_vaes_avx512(AES_GCM_KEY_VAES_AVX512(key),
 						       le_ctr, ghash_acc,
 						       src, dst, datalen);
-		else if (flags & FLAG_VAES_AVX2)
+		else
 			aes_gcm_enc_update_vaes_avx2(AES_GCM_KEY_VAES_AVX2(key),
 						     le_ctr, ghash_acc,
 						     src, dst, datalen);
-		else if (flags & FLAG_AVX)
-			aes_gcm_enc_update_aesni_avx(AES_GCM_KEY_AESNI(key),
-						     le_ctr, ghash_acc,
-						     src, dst, datalen);
-		else
-			aes_gcm_enc_update_aesni(AES_GCM_KEY_AESNI(key), le_ctr,
-						 ghash_acc, src, dst, datalen);
 	} else {
 		if (flags & FLAG_VAES_AVX512)
 			aes_gcm_dec_update_vaes_avx512(AES_GCM_KEY_VAES_AVX512(key),
 						       le_ctr, ghash_acc,
 						       src, dst, datalen);
-		else if (flags & FLAG_VAES_AVX2)
+		else
 			aes_gcm_dec_update_vaes_avx2(AES_GCM_KEY_VAES_AVX2(key),
 						     le_ctr, ghash_acc,
 						     src, dst, datalen);
-		else if (flags & FLAG_AVX)
-			aes_gcm_dec_update_aesni_avx(AES_GCM_KEY_AESNI(key),
-						     le_ctr, ghash_acc,
-						     src, dst, datalen);
-		else
-			aes_gcm_dec_update_aesni(AES_GCM_KEY_AESNI(key),
-						 le_ctr, ghash_acc,
-						 src, dst, datalen);
 	}
 }
 
-asmlinkage void
-aes_gcm_enc_final_aesni(const struct aes_gcm_key_aesni *key,
-			const u32 le_ctr[4], u8 ghash_acc[16],
-			u64 total_aadlen, u64 total_datalen);
-asmlinkage void
-aes_gcm_enc_final_aesni_avx(const struct aes_gcm_key_aesni *key,
-			    const u32 le_ctr[4], u8 ghash_acc[16],
-			    u64 total_aadlen, u64 total_datalen);
 asmlinkage void
 aes_gcm_enc_final_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
 			    const u32 le_ctr[4], u8 ghash_acc[16],
@@ -311,30 +216,12 @@ aes_gcm_enc_final(const struct aes_gcm_key *key,
 		aes_gcm_enc_final_vaes_avx512(AES_GCM_KEY_VAES_AVX512(key),
 					      le_ctr, ghash_acc,
 					      total_aadlen, total_datalen);
-	else if (flags & FLAG_VAES_AVX2)
+	else
 		aes_gcm_enc_final_vaes_avx2(AES_GCM_KEY_VAES_AVX2(key),
 					    le_ctr, ghash_acc,
 					    total_aadlen, total_datalen);
-	else if (flags & FLAG_AVX)
-		aes_gcm_enc_final_aesni_avx(AES_GCM_KEY_AESNI(key),
-					    le_ctr, ghash_acc,
-					    total_aadlen, total_datalen);
-	else
-		aes_gcm_enc_final_aesni(AES_GCM_KEY_AESNI(key),
-					le_ctr, ghash_acc,
-					total_aadlen, total_datalen);
 }
 
-asmlinkage bool __must_check
-aes_gcm_dec_final_aesni(const struct aes_gcm_key_aesni *key,
-			const u32 le_ctr[4], const u8 ghash_acc[16],
-			u64 total_aadlen, u64 total_datalen,
-			const u8 tag[16], int taglen);
-asmlinkage bool __must_check
-aes_gcm_dec_final_aesni_avx(const struct aes_gcm_key_aesni *key,
-			    const u32 le_ctr[4], const u8 ghash_acc[16],
-			    u64 total_aadlen, u64 total_datalen,
-			    const u8 tag[16], int taglen);
 asmlinkage bool __must_check
 aes_gcm_dec_final_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
 			    const u32 le_ctr[4], const u8 ghash_acc[16],
@@ -357,21 +244,11 @@ aes_gcm_dec_final(const struct aes_gcm_key *key, const u32 le_ctr[4],
 						     le_ctr, ghash_acc,
 						     total_aadlen, total_datalen,
 						     tag, taglen);
-	else if (flags & FLAG_VAES_AVX2)
+	else
 		return aes_gcm_dec_final_vaes_avx2(AES_GCM_KEY_VAES_AVX2(key),
 						   le_ctr, ghash_acc,
 						   total_aadlen, total_datalen,
 						   tag, taglen);
-	else if (flags & FLAG_AVX)
-		return aes_gcm_dec_final_aesni_avx(AES_GCM_KEY_AESNI(key),
-						   le_ctr, ghash_acc,
-						   total_aadlen, total_datalen,
-						   tag, taglen);
-	else
-		return aes_gcm_dec_final_aesni(AES_GCM_KEY_AESNI(key),
-					       le_ctr, ghash_acc,
-					       total_aadlen, total_datalen,
-					       tag, taglen);
 }
 
 /*
@@ -439,11 +316,6 @@ static int gcm_setkey(struct crypto_aead *tfm, const u8 *raw_key,
 	}
 
 	/* The assembly code assumes the following offsets. */
-	static_assert(offsetof(struct aes_gcm_key_aesni, base.aes_key.len) == 0);
-	static_assert(offsetof(struct aes_gcm_key_aesni, base.aes_key.k.rndkeys) == 16);
-	static_assert(offsetof(struct aes_gcm_key_aesni, h_powers) == 272);
-	static_assert(offsetof(struct aes_gcm_key_aesni, h_powers_xored) == 400);
-	static_assert(offsetof(struct aes_gcm_key_aesni, h_times_x64) == 464);
 	static_assert(offsetof(struct aes_gcm_key_vaes_avx2, base.aes_key.len) == 0);
 	static_assert(offsetof(struct aes_gcm_key_vaes_avx2, base.aes_key.k.rndkeys) == 16);
 	static_assert(offsetof(struct aes_gcm_key_vaes_avx2, h_powers) == 288);
@@ -464,9 +336,6 @@ static int gcm_setkey(struct crypto_aead *tfm, const u8 *raw_key,
 	} else {
 		static const u8 x_to_the_minus1[16] __aligned(__alignof__(be128)) = {
 			[0] = 0xc2, [15] = 1
-		};
-		static const u8 x_to_the_63[16] __aligned(__alignof__(be128)) = {
-			[7] = 1,
 		};
 		be128 h1 = {};
 		be128 h;
@@ -490,7 +359,7 @@ static int gcm_setkey(struct crypto_aead *tfm, const u8 *raw_key,
 				gf128mul_lle(&h, &h1);
 			}
 			memset(k->padding, 0, sizeof(k->padding));
-		} else if (flags & FLAG_VAES_AVX2) {
+		} else {
 			struct aes_gcm_key_vaes_avx2 *k =
 				AES_GCM_KEY_VAES_AVX2(key);
 			static const u8 indices[8] = { 0, 2, 1, 3, 4, 6, 5, 7 };
@@ -506,19 +375,6 @@ static int gcm_setkey(struct crypto_aead *tfm, const u8 *raw_key,
 				k->h_powers_xored[i] = k->h_powers[j][0] ^
 						       k->h_powers[j][1];
 			}
-		} else {
-			struct aes_gcm_key_aesni *k = AES_GCM_KEY_AESNI(key);
-
-			for (i = ARRAY_SIZE(k->h_powers) - 1; i >= 0; i--) {
-				k->h_powers[i][0] = be64_to_cpu(h.b);
-				k->h_powers[i][1] = be64_to_cpu(h.a);
-				k->h_powers_xored[i] = k->h_powers[i][0] ^
-						       k->h_powers[i][1];
-				gf128mul_lle(&h, &h1);
-			}
-			gf128mul_lle(&h1, (const be128 *)x_to_the_63);
-			k->h_times_x64[0] = be64_to_cpu(h1.b);
-			k->h_times_x64[1] = be64_to_cpu(h1.a);
 		}
 	}
 	return 0;
@@ -584,7 +440,6 @@ next:
 	if (unlikely(pos))
 		aes_gcm_aad_update(key, ghash_acc, buf, pos, flags);
 }
-
 
 /* __always_inline to optimize out the branches based on @flags */
 static __always_inline int
@@ -764,16 +619,6 @@ static struct aead_alg aes_gcm_algs_##suffix[] = { {			       \
 	},								       \
 } }
 
-/* aes_gcm_algs_aesni */
-DEFINE_GCM_ALGS(aesni, /* no flags */ 0,
-		"generic-gcm-aesni", "rfc4106-gcm-aesni",
-		AES_GCM_KEY_AESNI_SIZE, 400);
-
-/* aes_gcm_algs_aesni_avx */
-DEFINE_GCM_ALGS(aesni_avx, FLAG_AVX,
-		"generic-gcm-aesni-avx", "rfc4106-gcm-aesni-avx",
-		AES_GCM_KEY_AESNI_SIZE, 500);
-
 /* aes_gcm_algs_vaes_avx2 */
 DEFINE_GCM_ALGS(vaes_avx2, FLAG_VAES_AVX2,
 		"generic-gcm-vaes-avx2", "rfc4106-gcm-vaes-avx2",
@@ -790,10 +635,6 @@ static int __init register_avx_algs(void)
 
 	if (!boot_cpu_has(X86_FEATURE_AVX))
 		return 0;
-	err = crypto_register_aeads(aes_gcm_algs_aesni_avx,
-				    ARRAY_SIZE(aes_gcm_algs_aesni_avx));
-	if (err)
-		return err;
 	/*
 	 * Note: not all the algorithms registered below actually require
 	 * VPCLMULQDQ.  But in practice every CPU with VAES also has VPCLMULQDQ.
@@ -836,7 +677,6 @@ static int __init register_avx_algs(void)
 
 static void unregister_avx_algs(void)
 {
-	unregister_aeads(aes_gcm_algs_aesni_avx);
 	unregister_aeads(aes_gcm_algs_vaes_avx2);
 	unregister_aeads(aes_gcm_algs_vaes_avx512);
 }
@@ -854,11 +694,6 @@ static int __init aesni_init(void)
 	if (!x86_match_cpu(aesni_cpu_id))
 		return -ENODEV;
 
-	err = crypto_register_aeads(aes_gcm_algs_aesni,
-				    ARRAY_SIZE(aes_gcm_algs_aesni));
-	if (err)
-		return err;
-
 	err = register_avx_algs();
 	if (err)
 		goto unregister_avx;
@@ -867,15 +702,11 @@ static int __init aesni_init(void)
 
 unregister_avx:
 	unregister_avx_algs();
-	crypto_unregister_aeads(aes_gcm_algs_aesni,
-				ARRAY_SIZE(aes_gcm_algs_aesni));
 	return err;
 }
 
 static void __exit aesni_exit(void)
 {
-	crypto_unregister_aeads(aes_gcm_algs_aesni,
-				ARRAY_SIZE(aes_gcm_algs_aesni));
 	unregister_avx_algs();
 }
 

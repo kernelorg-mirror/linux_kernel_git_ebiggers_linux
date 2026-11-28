@@ -1146,7 +1146,7 @@ static struct aead_alg aead_algs[] = {
 	{
 		.base.cra_name = "gcm(aes)",
 		.base.cra_driver_name = "gcm-aes-lib",
-		.base.cra_priority = 110,
+		.base.cra_priority = IS_ENABLED(CONFIG_X86) ? 500 : 110,
 		.base.cra_blocksize = 1,
 		.base.cra_ctxsize = sizeof(struct aes_gcm_key),
 		.base.cra_module = THIS_MODULE,
@@ -1161,7 +1161,7 @@ static struct aead_alg aead_algs[] = {
 	{
 		.base.cra_name = "rfc4106(gcm(aes))",
 		.base.cra_driver_name = "rfc4106-gcm-aes-lib",
-		.base.cra_priority = 110,
+		.base.cra_priority = IS_ENABLED(CONFIG_X86) ? 500 : 110,
 		.base.cra_blocksize = 1,
 		.base.cra_ctxsize = sizeof(struct aes_rfc4106_key),
 		.base.cra_module = THIS_MODULE,
