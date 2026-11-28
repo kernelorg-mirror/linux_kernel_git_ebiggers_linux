@@ -31,4 +31,13 @@ static inline bool gf128hash_use_vpclmul_avx2(void)
 	       cpu_feature_enabled(X86_FEATURE_VPCLMULQDQ);
 }
 
+static inline bool gf128hash_use_vpclmul_avx512(void)
+{
+	return gf128hash_use_vpclmul_avx2() &&
+	       cpu_feature_enabled(X86_FEATURE_AVX512BW) &&
+	       cpu_feature_enabled(X86_FEATURE_AVX512VL) &&
+	       cpu_feature_enabled(X86_FEATURE_BMI2) &&
+	       !cpu_feature_enabled(X86_FEATURE_PREFER_YMM);
+}
+
 #endif /* _LIB_CRYPTO_X86_GF128HASH_CPU_H */

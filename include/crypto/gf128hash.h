@@ -37,16 +37,32 @@ struct polyval_elem {
 #if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_X86_64)
 /**
  * struct gf128hash_key_x86 - Prepared key for GHASH or POLYVAL on x86_64
- * @h_powers: Powers of the hash key H^8 through H^1, in POLYVAL format
  * @h_powers_xored: Halves of @h_powers XOR'd together: ordered as
  *		    (H^8, H^6, H^7, H^5, H^4, H^2, H^3, H^1) if
  *		    gf128hash_use_vpclmul_avx2(), else (H^8..H^1)
+ * @unused: Zeroized padding
+ * @h_powers: Powers of the hash key H^8 through H^1, in POLYVAL format
+ * @h_powers16: Powers of the hash key H^16 through H^1, in POLYVAL format
+ * @padding: Zeroized padding blocks for the AVX512 tail loop
  * @h_times_xm64: H^1 * x^-64 mod G(x), for 1-step-reduction single-block
  *		  multiplications
+ *
+ * The union uses @h_powers16 if gf128hash_use_vpclmul_avx512(), otherwise
+ * (@h_powers_xored, @unused, @h_powers).  H^1 (@h_powers[7] / @h_powers16[15])
+ * and @h_times_xm64 are at the same offsets in both layouts.
  */
 struct gf128hash_key_x86 {
-	struct polyval_elem h_powers[8];
-	__le64 h_powers_xored[8];
+	union {
+		/* !gf128hash_use_vpclmul_avx512() */
+		struct {
+			__le64 h_powers_xored[8];
+			u8 unused[64];
+			struct polyval_elem h_powers[8];
+		};
+		/* gf128hash_use_vpclmul_avx512() */
+		struct polyval_elem h_powers16[16];
+	};
+	struct polyval_elem padding[3];
 	struct polyval_elem h_times_xm64;
 };
 #endif

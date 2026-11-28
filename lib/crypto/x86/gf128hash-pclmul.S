@@ -175,10 +175,10 @@
 // Offsets in struct gf128hash_key_x86.  h_powers[0..7] holds H^8..H^1,
 // h_powers_xored[i] holds the XOR of the two 64-bit halves of h_powers[i], and
 // h_times_xm64 holds H^1 * x^-64 mod G(x).
-#define OFFSETOF_H_POWERS	0
-#define OFFSETOFEND_H_POWERS	128
-#define OFFSETOF_H_POWERS_XORED	128
-#define OFFSETOF_H_TIMES_XM64	192
+#define OFFSETOF_H_POWERS_XORED	0
+#define OFFSETOF_H_POWERS	128
+#define OFFSETOFEND_H_POWERS	256
+#define OFFSETOF_H_TIMES_XM64	304
 
 .text
 

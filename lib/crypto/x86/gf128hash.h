@@ -8,17 +8,26 @@
 #include "gf128hash-cpu.h"
 
 #define NUM_H_POWERS 8
+#define NUM_H_POWERS_AVX512 16
 
 static_assert(sizeof_field(struct gf128hash_key_x86, h_powers) ==
 	      NUM_H_POWERS * sizeof(struct polyval_elem));
-static_assert(offsetof(struct gf128hash_key_x86, h_powers) == 0);
-static_assert(offsetof(struct gf128hash_key_x86, h_powers_xored) == 128);
-static_assert(offsetof(struct gf128hash_key_x86, h_times_xm64) == 192);
-static_assert(sizeof(struct gf128hash_key_x86) == 208);
+static_assert(sizeof_field(struct gf128hash_key_x86, h_powers16) ==
+	      NUM_H_POWERS_AVX512 * sizeof(struct polyval_elem));
+static_assert(offsetof(struct gf128hash_key_x86, h_powers_xored) == 0);
+static_assert(offsetof(struct gf128hash_key_x86, h_powers) == 128);
+static_assert(offsetof(struct gf128hash_key_x86, h_powers16) == 0);
+static_assert(offsetof(struct gf128hash_key_x86, padding) == 256);
+static_assert(offsetof(struct gf128hash_key_x86, h_times_xm64) == 304);
+static_assert(offsetof(struct gf128hash_key_x86, h_powers[NUM_H_POWERS - 1]) ==
+	      offsetof(struct gf128hash_key_x86,
+		       h_powers16[NUM_H_POWERS_AVX512 - 1]));
+static_assert(sizeof(struct gf128hash_key_x86) == 320);
 
 static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_pclmul);
 static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_pclmul_avx);
 static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_vpclmul_avx2);
+static __ro_after_init DEFINE_STATIC_KEY_FALSE(have_vpclmul_avx512);
 
 void gf128hash_mul_pclmul(struct polyval_elem *acc,
 			  const struct gf128hash_key_x86 *key);
@@ -31,12 +40,16 @@ void ghash_preparekey_pclmul_avx(struct gf128hash_key_x86 *key,
 				 const u8 raw_key[GHASH_BLOCK_SIZE]);
 void ghash_preparekey_vpclmul_avx2(struct gf128hash_key_x86 *key,
 				   const u8 raw_key[GHASH_BLOCK_SIZE]);
+void ghash_preparekey_vpclmul_avx512(struct gf128hash_key_x86 *key,
+				     const u8 raw_key[GHASH_BLOCK_SIZE]);
 void polyval_preparekey_pclmul(struct gf128hash_key_x86 *key,
 			       const u8 raw_key[POLYVAL_BLOCK_SIZE]);
 void polyval_preparekey_pclmul_avx(struct gf128hash_key_x86 *key,
 				   const u8 raw_key[POLYVAL_BLOCK_SIZE]);
 void polyval_preparekey_vpclmul_avx2(struct gf128hash_key_x86 *key,
 				     const u8 raw_key[POLYVAL_BLOCK_SIZE]);
+void polyval_preparekey_vpclmul_avx512(struct gf128hash_key_x86 *key,
+				       const u8 raw_key[POLYVAL_BLOCK_SIZE]);
 
 void ghash_blocks_pclmul(struct polyval_elem *acc,
 			 const struct gf128hash_key_x86 *key, const u8 *data,
@@ -47,6 +60,9 @@ void ghash_blocks_pclmul_avx(struct polyval_elem *acc,
 void ghash_blocks_vpclmul_avx2(struct polyval_elem *acc,
 			       const struct gf128hash_key_x86 *key,
 			       const u8 *data, size_t nblocks);
+void ghash_blocks_vpclmul_avx512(struct polyval_elem *acc,
+				 const struct gf128hash_key_x86 *key,
+				 const u8 *data, size_t nblocks);
 void polyval_blocks_pclmul(struct polyval_elem *acc,
 			   const struct gf128hash_key_x86 *key, const u8 *data,
 			   size_t nblocks);
@@ -56,6 +72,9 @@ void polyval_blocks_pclmul_avx(struct polyval_elem *acc,
 void polyval_blocks_vpclmul_avx2(struct polyval_elem *acc,
 				 const struct gf128hash_key_x86 *key,
 				 const u8 *data, size_t nblocks);
+void polyval_blocks_vpclmul_avx512(struct polyval_elem *acc,
+				   const struct gf128hash_key_x86 *key,
+				   const u8 *data, size_t nblocks);
 
 /*
  * Compute *out = *in * x^-64 mod G(x), where
@@ -96,12 +115,32 @@ static void gf128hash_preparekey_fallback(struct gf128hash_key_x86 *key)
 	}
 }
 
+static void gf128hash_preparekey_avx512_fallback(struct gf128hash_key_x86 *key)
+{
+	polyval_mul_xm64_generic(&key->h_times_xm64,
+				 &key->h_powers16[NUM_H_POWERS_AVX512 - 1]);
+	for (int i = NUM_H_POWERS_AVX512 - 2; i >= 0; i--) {
+		key->h_powers16[i] = key->h_powers16[i + 1];
+		polyval_mul_generic(&key->h_powers16[i],
+				    &key->h_powers16[NUM_H_POWERS_AVX512 - 1]);
+	}
+	memset(key->padding, 0, sizeof(key->padding));
+}
+
 static __always_inline void
 gf128hash_preparekey_x86(struct gf128hash_key_x86 *key, const u8 raw_key[16],
 			 bool is_ghash)
 {
 	if (static_branch_likely(&have_pclmul) && likely(irq_fpu_usable())) {
 		kernel_fpu_begin_mask(0);
+		if (static_branch_likely(&have_vpclmul_avx512)) {
+			if (is_ghash)
+				ghash_preparekey_vpclmul_avx512(key, raw_key);
+			else
+				polyval_preparekey_vpclmul_avx512(key, raw_key);
+			kernel_fpu_end();
+			return;
+		}
 		if (static_branch_likely(&have_vpclmul_avx2)) {
 			if (is_ghash)
 				ghash_preparekey_vpclmul_avx2(key, raw_key);
@@ -126,8 +165,20 @@ gf128hash_preparekey_x86(struct gf128hash_key_x86 *key, const u8 raw_key[16],
 		else
 			memcpy(&key->h_powers[NUM_H_POWERS - 1], raw_key,
 			       POLYVAL_BLOCK_SIZE);
+		/*
+		 * Choose the key layout using cpu_feature_enabled() rather than
+		 * the have_* static keys so that keys prepared before
+		 * gf128hash_mod_init() runs (e.g. during libaes's FIPS
+		 * self-test) use the same layout as keys prepared afterward.
+		 */
+		if (gf128hash_use_vpclmul_avx512()) {
+			gf128hash_preparekey_avx512_fallback(key);
+			return;
+		}
 		gf128hash_preparekey_fallback(key);
 	}
+	memset(key->unused, 0, sizeof(key->unused));
+	memset(key->padding, 0, sizeof(key->padding));
 }
 
 #define ghash_preparekey_arch ghash_preparekey_arch
@@ -185,7 +236,14 @@ gf128hash_blocks_x86(struct polyval_elem *acc,
 					 4096 / GHASH_BLOCK_SIZE);
 
 			kernel_fpu_begin_mask(0);
-			if (static_branch_likely(&have_vpclmul_avx2)) {
+			if (static_branch_likely(&have_vpclmul_avx512)) {
+				if (is_ghash)
+					ghash_blocks_vpclmul_avx512(acc, key,
+								    data, n);
+				else
+					polyval_blocks_vpclmul_avx512(acc, key,
+								      data, n);
+			} else if (static_branch_likely(&have_vpclmul_avx2)) {
 				if (is_ghash)
 					ghash_blocks_vpclmul_avx2(acc, key,
 								  data, n);
@@ -246,8 +304,11 @@ static void gf128hash_mod_init_arch(void)
 
 	if (gf128hash_use_pclmul_avx()) {
 		static_branch_enable(&have_pclmul_avx);
-		if (gf128hash_use_vpclmul_avx2())
+		if (gf128hash_use_vpclmul_avx2()) {
 			static_branch_enable(&have_vpclmul_avx2);
+			if (gf128hash_use_vpclmul_avx512())
+				static_branch_enable(&have_vpclmul_avx512);
+		}
 	}
 	static_branch_enable(&have_pclmul);
 }
