@@ -14,6 +14,8 @@ source "crypto/async_tx/Kconfig"
 menuconfig CRYPTO
 	tristate "Cryptographic API"
 	select CRYPTO_LIB_UTILS
+	select CRYPTO_AES if CRYPTO_AES_NI_INTEL && X86_64
+	select CRYPTO_XTS if CRYPTO_AES_NI_INTEL && X86_64
 	help
 	  This option provides the core Cryptographic API.
 
@@ -1377,3 +1379,10 @@ source "certs/Kconfig"
 source "crypto/krb5/Kconfig"
 
 endif	# if CRYPTO
+
+config CRYPTO_AES_NI_INTEL
+	tristate
+	transitional
+	help
+	  This transitional symbol ensures that kconfigs that had aesni-intel
+	  enabled still get AES-XTS support (via CRYPTO_AES and CRYPTO_XTS).

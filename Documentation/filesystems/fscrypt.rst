@@ -447,14 +447,12 @@ API, but the filenames mode still does.
 - AES-256-XTS and AES-256-CBC-CTS
     - Recommended:
         - arm64: CONFIG_CRYPTO_AES_ARM64_CE_BLK
-        - x86: CONFIG_CRYPTO_AES_NI_INTEL
 
 - AES-256-HCTR2
     - Mandatory:
         - CONFIG_CRYPTO_HCTR2
     - Recommended:
         - arm64: CONFIG_CRYPTO_AES_ARM64_CE_BLK
-        - x86: CONFIG_CRYPTO_AES_NI_INTEL
 
 - Adiantum
     - Mandatory:
