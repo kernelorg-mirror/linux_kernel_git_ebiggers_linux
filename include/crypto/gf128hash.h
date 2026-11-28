@@ -38,7 +38,9 @@ struct polyval_elem {
 /**
  * struct gf128hash_key_x86 - Prepared key for GHASH or POLYVAL on x86_64
  * @h_powers: Powers of the hash key H^8 through H^1, in POLYVAL format
- * @h_powers_xored: Halves of each entry of @h_powers XOR'd together
+ * @h_powers_xored: Halves of @h_powers XOR'd together: ordered as
+ *		    (H^8, H^6, H^7, H^5, H^4, H^2, H^3, H^1) if
+ *		    gf128hash_use_vpclmul_avx2(), else (H^8..H^1)
  * @h_times_xm64: H^1 * x^-64 mod G(x), for 1-step-reduction single-block
  *		  multiplications
  */

@@ -187,7 +187,8 @@ OBJECT_FILES_NON_STANDARD_powerpc/ghashp8-ppc.o := y
 endif
 
 libgf128hash-$(CONFIG_RISCV) += riscv/ghash-riscv64-zvkg.o
-libgf128hash-$(CONFIG_X86) += x86/gf128hash-pclmul.o
+libgf128hash-$(CONFIG_X86) += x86/gf128hash-pclmul.o \
+			      x86/gf128hash-vpclmul-avx2.o
 endif # CONFIG_CRYPTO_LIB_GF128HASH_ARCH
 
 # clean-files must be defined unconditionally

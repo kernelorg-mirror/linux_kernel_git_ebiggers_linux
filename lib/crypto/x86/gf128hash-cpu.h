@@ -23,4 +23,12 @@ static inline bool gf128hash_use_pclmul_avx(void)
 	return gf128hash_use_pclmul() && cpu_feature_enabled(X86_FEATURE_AVX);
 }
 
+static inline bool gf128hash_use_vpclmul_avx2(void)
+{
+	return gf128hash_use_pclmul_avx() &&
+	       cpu_feature_enabled(X86_FEATURE_VAES) &&
+	       cpu_feature_enabled(X86_FEATURE_AVX2) &&
+	       cpu_feature_enabled(X86_FEATURE_VPCLMULQDQ);
+}
+
 #endif /* _LIB_CRYPTO_X86_GF128HASH_CPU_H */
