@@ -34,22 +34,45 @@ struct polyval_elem {
 	};
 };
 
+#if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_X86_64)
+/**
+ * struct gf128hash_key_x86 - Prepared key for GHASH or POLYVAL on x86_64
+ * @h_powers: Powers of the hash key H^8 through H^1, in POLYVAL format
+ * @h_powers_xored: Halves of each entry of @h_powers XOR'd together
+ * @h_times_xm64: H^1 * x^-64 mod G(x), for 1-step-reduction single-block
+ *		  multiplications
+ */
+struct gf128hash_key_x86 {
+	struct polyval_elem h_powers[8];
+	__le64 h_powers_xored[8];
+	struct polyval_elem h_times_xm64;
+};
+#endif
+
 /**
  * struct ghash_key - Prepared key for GHASH
  *
  * Use ghash_preparekey() to initialize this.
  */
 struct ghash_key {
-#if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_PPC64)
+#if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_X86_64)
+	/** @k: Prepared key in x86_64 format */
+	struct gf128hash_key_x86 k;
+#elif defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_PPC64)
 	/** @htable: GHASH key format used by the POWER8 assembly code */
 	u64 htable[4][2];
+	/** @h: The hash key H, in POLYVAL format */
+	struct polyval_elem h;
 #elif defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && \
 	(defined(CONFIG_RISCV) || defined(CONFIG_S390))
 	/** @h_raw: The hash key H, in GHASH format */
 	u8 h_raw[GHASH_BLOCK_SIZE];
-#endif
 	/** @h: The hash key H, in POLYVAL format */
 	struct polyval_elem h;
+#else
+	/** @h: The hash key H, in POLYVAL format */
+	struct polyval_elem h;
+#endif
 };
 
 /**
@@ -63,8 +86,10 @@ struct ghash_key {
  * exponentiation repeats the POLYVAL dot operation, with its "extra" x^-128.
  */
 struct polyval_key {
-#if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && \
-	(defined(CONFIG_ARM64) || defined(CONFIG_X86))
+#if defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_X86_64)
+	/** @k: Prepared key in x86_64 format */
+	struct gf128hash_key_x86 k;
+#elif defined(CONFIG_CRYPTO_LIB_GF128HASH_ARCH) && defined(CONFIG_ARM64)
 	/** @h_powers: Powers of the hash key H^8 through H^1 */
 	struct polyval_elem h_powers[8];
 #else
