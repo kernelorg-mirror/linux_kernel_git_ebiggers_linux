@@ -65,7 +65,8 @@ ifneq ($(CONFIG_CRYPTO_LIB_AES_CTR),)
 libaes-$(CONFIG_X86_64) += x86/aes-ctr-avx-x86_64.o
 endif
 ifneq ($(CONFIG_CRYPTO_LIB_AES_GCM),)
-libaes-$(CONFIG_X86_64) += x86/aes-gcm-aesni-x86_64.o
+libaes-$(CONFIG_X86_64) += x86/aes-gcm-aesni-x86_64.o \
+			   x86/aes-gcm-vaes-avx2.o
 endif
 ifneq ($(CONFIG_CRYPTO_LIB_AES_XTS),)
 libaes-$(CONFIG_X86_64) += x86/aes-xts-avx-x86_64.o

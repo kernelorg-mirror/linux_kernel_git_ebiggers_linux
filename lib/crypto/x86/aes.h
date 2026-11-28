@@ -439,6 +439,14 @@ void aes_gcm_dec_update_aesni_avx(u8 *dst, const u8 *src, size_t len,
 				  struct polyval_elem *ghash_acc,
 				  const __be32 ctr32[4],
 				  const struct aes_gcm_key *key);
+void aes_gcm_enc_update_vaes_avx2(u8 *dst, const u8 *src, size_t len,
+				  struct polyval_elem *ghash_acc,
+				  const __be32 ctr32[4],
+				  const struct aes_gcm_key *key);
+void aes_gcm_dec_update_vaes_avx2(u8 *dst, const u8 *src, size_t len,
+				  struct polyval_elem *ghash_acc,
+				  const __be32 ctr32[4],
+				  const struct aes_gcm_key *key);
 void aes_gcm_enc_final_aesni(const struct aes_gcm_key *key,
 			     const struct polyval_elem *ghash_acc,
 			     const u8 nonce[12], u64 ad_len, u64 data_len,
@@ -461,7 +469,14 @@ aes_gcm_update_x86_fpu(u8 *dst, const u8 *src, size_t len,
 		       struct polyval_elem *ghash_acc, const __be32 ctr32[4],
 		       const struct aes_gcm_key *key, bool enc)
 {
-	if (static_branch_likely(&have_aesni_avx)) {
+	if (static_branch_likely(&have_vaes_avx2)) {
+		if (enc)
+			aes_gcm_enc_update_vaes_avx2(dst, src, len, ghash_acc,
+						     ctr32, key);
+		else
+			aes_gcm_dec_update_vaes_avx2(dst, src, len, ghash_acc,
+						     ctr32, key);
+	} else if (static_branch_likely(&have_aesni_avx)) {
 		if (enc)
 			aes_gcm_enc_update_aesni_avx(dst, src, len, ghash_acc,
 						     ctr32, key);
@@ -485,7 +500,7 @@ aes_gcm_crypt_update_x86(u8 *dst, const u8 *src, size_t len,
 			 const struct aes_gcm_key *key, bool enc)
 {
 	if (!static_branch_likely(&have_aesni_pclmul) ||
-	    static_branch_likely(&have_vaes_avx2) ||
+	    static_branch_likely(&have_vaes_avx512) ||
 	    unlikely(!irq_fpu_usable()))
 		return false;
 
@@ -541,7 +556,7 @@ aes_gcm_crypt_x86(u8 *dst, const u8 *src, size_t data_len, u8 *authtag,
 	__be32 ctr32[4];
 
 	if (!static_branch_likely(&have_aesni_pclmul) ||
-	    static_branch_likely(&have_vaes_avx2) ||
+	    static_branch_likely(&have_vaes_avx512) ||
 	    unlikely(!irq_fpu_usable()))
 		return false;
 

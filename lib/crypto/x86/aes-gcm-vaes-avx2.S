@@ -108,10 +108,6 @@
 .Lgfpoly:
 	.octa	0xc2000000000000000000000000000001
 
-	// Same as above, but with the (1 << 64) bit set.
-.Lgfpoly_and_internal_carrybit:
-	.octa	0xc2000000000000010000000000000001
-
 	// Values needed to prepare the initial vector of counter blocks.
 .Lctr_pattern:
 	.octa	0
@@ -121,53 +117,15 @@
 .Linc_2blocks:
 	.octa	2
 
-// Offsets in struct aes_gcm_key_vaes_avx2
+// Offsets in struct aes_gcm_key
 #define OFFSETOF_AESKEYLEN	0
 #define OFFSETOF_AESROUNDKEYS	16
-#define OFFSETOF_H_POWERS	288
+#define OFFSETOF_H_POWERS_XORED	(256 + 0)
+#define OFFSETOF_H_POWERS	(256 + 128)
 #define NUM_H_POWERS		8
-#define OFFSETOFEND_H_POWERS    (OFFSETOF_H_POWERS + (NUM_H_POWERS * 16))
-#define OFFSETOF_H_POWERS_XORED	OFFSETOFEND_H_POWERS
+#define OFFSETOFEND_H_POWERS	(OFFSETOF_H_POWERS + (NUM_H_POWERS * 16))
 
 .text
-
-// Do one step of GHASH-multiplying the 128-bit lanes of \a by the 128-bit lanes
-// of \b and storing the reduced products in \dst.  Uses schoolbook
-// multiplication.
-.macro	_ghash_mul_step	i, a, b, dst, gfpoly, t0, t1, t2
-.if \i == 0
-	vpclmulqdq	$0x00, \a, \b, \t0	  // LO = a_L * b_L
-	vpclmulqdq	$0x01, \a, \b, \t1	  // MI_0 = a_L * b_H
-.elseif \i == 1
-	vpclmulqdq	$0x10, \a, \b, \t2	  // MI_1 = a_H * b_L
-.elseif \i == 2
-	vpxor		\t2, \t1, \t1		  // MI = MI_0 + MI_1
-.elseif \i == 3
-	vpclmulqdq	$0x01, \t0, \gfpoly, \t2  // LO_L*(x^63 + x^62 + x^57)
-.elseif \i == 4
-	vpshufd		$0x4e, \t0, \t0		  // Swap halves of LO
-.elseif \i == 5
-	vpxor		\t0, \t1, \t1		  // Fold LO into MI (part 1)
-	vpxor		\t2, \t1, \t1		  // Fold LO into MI (part 2)
-.elseif \i == 6
-	vpclmulqdq	$0x11, \a, \b, \dst	  // HI = a_H * b_H
-.elseif \i == 7
-	vpclmulqdq	$0x01, \t1, \gfpoly, \t0  // MI_L*(x^63 + x^62 + x^57)
-.elseif \i == 8
-	vpshufd		$0x4e, \t1, \t1		  // Swap halves of MI
-.elseif \i == 9
-	vpxor		\t1, \dst, \dst		  // Fold MI into HI (part 1)
-	vpxor		\t0, \dst, \dst		  // Fold MI into HI (part 2)
-.endif
-.endm
-
-// GHASH-multiply the 128-bit lanes of \a by the 128-bit lanes of \b and store
-// the reduced products in \dst.  See _ghash_mul_step for full explanation.
-.macro	_ghash_mul	a, b, dst, gfpoly, t0, t1, t2
-.irp i, 0,1,2,3,4,5,6,7,8,9
-	_ghash_mul_step	\i, \a, \b, \dst, \gfpoly, \t0, \t1, \t2
-.endr
-.endm
 
 // GHASH-multiply the 128-bit lanes of \a by the 128-bit lanes of \b and add the
 // *unreduced* products to \lo, \mi, and \hi.
@@ -183,7 +141,7 @@
 .endm
 
 // Reduce the unreduced products from \lo, \mi, and \hi and store the 128-bit
-// reduced products in \hi.  See _ghash_mul_step for explanation of reduction.
+// reduced products in \hi.
 .macro	_ghash_reduce	lo, mi, hi, gfpoly, t0
 	vpclmulqdq	$0x01, \lo, \gfpoly, \t0
 	vpshufd		$0x4e, \lo, \lo
@@ -195,122 +153,12 @@
 	vpxor		\t0, \hi, \hi
 .endm
 
-// This is a specialized version of _ghash_mul that computes \a * \a, i.e. it
-// squares \a.  It skips computing MI = (a_L * a_H) + (a_H * a_L) = 0.
-.macro	_ghash_square	a, dst, gfpoly, t0, t1
-	vpclmulqdq	$0x00, \a, \a, \t0	  // LO = a_L * a_L
-	vpclmulqdq	$0x11, \a, \a, \dst	  // HI = a_H * a_H
-	vpclmulqdq	$0x01, \t0, \gfpoly, \t1  // LO_L*(x^63 + x^62 + x^57)
-	vpshufd		$0x4e, \t0, \t0		  // Swap halves of LO
-	vpxor		\t0, \t1, \t1		  // Fold LO into MI
-	vpclmulqdq	$0x01, \t1, \gfpoly, \t0  // MI_L*(x^63 + x^62 + x^57)
-	vpshufd		$0x4e, \t1, \t1		  // Swap halves of MI
-	vpxor		\t1, \dst, \dst		  // Fold MI into HI (part 1)
-	vpxor		\t0, \dst, \dst		  // Fold MI into HI (part 2)
-.endm
-
-// void aes_gcm_precompute_vaes_avx2(struct aes_gcm_key_vaes_avx2 *key);
-//
-// Given the expanded AES key |key->base.aes_key|, derive the GHASH subkey and
-// initialize |key->h_powers| and |key->h_powers_xored|.
-//
-// We use h_powers[0..7] to store H^8 through H^1, and h_powers_xored[0..7] to
-// store the 64-bit halves of the key powers XOR'd together (for Karatsuba
-// multiplication) in the order 8,6,7,5,4,2,3,1.
-SYM_FUNC_START(aes_gcm_precompute_vaes_avx2)
-
-	// Function arguments
-	.set	KEY,		%rdi
-
-	// Additional local variables
-	.set	POWERS_PTR,	%rsi
-	.set	RNDKEYLAST_PTR,	%rdx
-	.set	TMP0,		%ymm0
-	.set	TMP0_XMM,	%xmm0
-	.set	TMP1,		%ymm1
-	.set	TMP1_XMM,	%xmm1
-	.set	TMP2,		%ymm2
-	.set	TMP2_XMM,	%xmm2
-	.set	H_CUR,		%ymm3
-	.set	H_CUR_XMM,	%xmm3
-	.set	H_CUR2,		%ymm4
-	.set	H_INC,		%ymm5
-	.set	H_INC_XMM,	%xmm5
-	.set	GFPOLY,		%ymm6
-	.set	GFPOLY_XMM,	%xmm6
-
-	// Encrypt an all-zeroes block to get the raw hash subkey.
-	movl		OFFSETOF_AESKEYLEN(KEY), %eax
-	lea		OFFSETOF_AESROUNDKEYS+6*16(KEY,%rax,4), RNDKEYLAST_PTR
-	vmovdqu		OFFSETOF_AESROUNDKEYS(KEY), H_CUR_XMM
-	lea		OFFSETOF_AESROUNDKEYS+16(KEY), %rax
-1:
-	vaesenc		(%rax), H_CUR_XMM, H_CUR_XMM
-	add		$16, %rax
-	cmp		%rax, RNDKEYLAST_PTR
-	jne		1b
-	vaesenclast	(RNDKEYLAST_PTR), H_CUR_XMM, H_CUR_XMM
-
-	// Reflect the bytes of the raw hash subkey.
-	vpshufb		.Lbswap_mask(%rip), H_CUR_XMM, H_CUR_XMM
-
-	// Finish preprocessing the byte-reflected hash subkey by multiplying it
-	// by x^-1 ("standard" interpretation of polynomial coefficients) or
-	// equivalently x^1 (natural interpretation).  This gets the key into a
-	// format that avoids having to bit-reflect the data blocks later.
-	vpshufd		$0xd3, H_CUR_XMM, TMP0_XMM
-	vpsrad		$31, TMP0_XMM, TMP0_XMM
-	vpaddq		H_CUR_XMM, H_CUR_XMM, H_CUR_XMM
-	vpand		.Lgfpoly_and_internal_carrybit(%rip), TMP0_XMM, TMP0_XMM
-	vpxor		TMP0_XMM, H_CUR_XMM, H_CUR_XMM
-
-	// Load the gfpoly constant.
-	vbroadcasti128	.Lgfpoly(%rip), GFPOLY
-
-	// Square H^1 to get H^2.
-	_ghash_square	H_CUR_XMM, H_INC_XMM, GFPOLY_XMM, TMP0_XMM, TMP1_XMM
-
-	// Create H_CUR = [H^2, H^1] and H_INC = [H^2, H^2].
-	vinserti128	$1, H_CUR_XMM, H_INC, H_CUR
-	vinserti128	$1, H_INC_XMM, H_INC, H_INC
-
-	// Compute H_CUR2 = [H^4, H^3].
-	_ghash_mul	H_INC, H_CUR, H_CUR2, GFPOLY, TMP0, TMP1, TMP2
-
-	// Store [H^2, H^1] and [H^4, H^3].
-	vmovdqu		H_CUR, OFFSETOF_H_POWERS+3*32(KEY)
-	vmovdqu		H_CUR2, OFFSETOF_H_POWERS+2*32(KEY)
-
-	// For Karatsuba multiplication: compute and store the two 64-bit halves
-	// of each key power XOR'd together.  Order is 4,2,3,1.
-	vpunpcklqdq	H_CUR, H_CUR2, TMP0
-	vpunpckhqdq	H_CUR, H_CUR2, TMP1
-	vpxor		TMP1, TMP0, TMP0
-	vmovdqu		TMP0, OFFSETOF_H_POWERS_XORED+32(KEY)
-
-	// Compute and store H_CUR = [H^6, H^5] and H_CUR2 = [H^8, H^7].
-	_ghash_mul	H_INC, H_CUR2, H_CUR, GFPOLY, TMP0, TMP1, TMP2
-	_ghash_mul	H_INC, H_CUR, H_CUR2, GFPOLY, TMP0, TMP1, TMP2
-	vmovdqu		H_CUR, OFFSETOF_H_POWERS+1*32(KEY)
-	vmovdqu		H_CUR2, OFFSETOF_H_POWERS+0*32(KEY)
-
-	// Again, compute and store the two 64-bit halves of each key power
-	// XOR'd together.  Order is 8,6,7,5.
-	vpunpcklqdq	H_CUR, H_CUR2, TMP0
-	vpunpckhqdq	H_CUR, H_CUR2, TMP1
-	vpxor		TMP1, TMP0, TMP0
-	vmovdqu		TMP0, OFFSETOF_H_POWERS_XORED(KEY)
-
-	vzeroupper
-	RET
-SYM_FUNC_END(aes_gcm_precompute_vaes_avx2)
-
 // Do one step of the GHASH update of four vectors of data blocks.
 //   \i: the step to do, 0 through 9
-//   \ghashdata_ptr: pointer to the data blocks (ciphertext or AAD)
-//   KEY: pointer to struct aes_gcm_key_vaes_avx2
+//   \ghashdata_ptr: pointer to the data blocks (ciphertext)
+//   KEY: pointer to struct aes_gcm_key
 //   BSWAP_MASK: mask for reflecting the bytes of blocks
-//   H_POW[2-1]_XORED: cached values from KEY->h_powers_xored
+//   H_POW[2-1]_XORED: cached values from KEY->ghash.k.h_powers_xored
 //   TMP[0-2]: temporary registers.  TMP[1-2] must be preserved across steps.
 //   LO, MI: working state for this macro that must be preserved across steps
 //   GHASH_ACC: the GHASH accumulator (input/output)
@@ -480,136 +328,6 @@ SYM_FUNC_END(aes_gcm_precompute_vaes_avx2)
 .Ldone\@:
 .endm
 
-// void aes_gcm_aad_update_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
-//				     u8 ghash_acc[16],
-//				     const u8 *aad, int aadlen);
-//
-// This function processes the AAD (Additional Authenticated Data) in GCM.
-// Using the key |key|, it updates the GHASH accumulator |ghash_acc| with the
-// data given by |aad| and |aadlen|.  On the first call, |ghash_acc| must be all
-// zeroes.  |aadlen| must be a multiple of 16, except on the last call where it
-// can be any length.  The caller must do any buffering needed to ensure this.
-//
-// This handles large amounts of AAD efficiently, while also keeping overhead
-// low for small amounts which is the common case.  TLS and IPsec use less than
-// one block of AAD, but (uncommonly) other use cases may use much more.
-SYM_FUNC_START(aes_gcm_aad_update_vaes_avx2)
-
-	// Function arguments
-	.set	KEY,		%rdi
-	.set	GHASH_ACC_PTR,	%rsi
-	.set	AAD,		%rdx
-	.set	AADLEN,		%ecx	// Must be %ecx for _load_partial_block
-	.set	AADLEN64,	%rcx	// Zero-extend AADLEN before using!
-
-	// Additional local variables.
-	// %rax and %r8 are used as temporary registers.
-	.set	TMP0,		%ymm0
-	.set	TMP0_XMM,	%xmm0
-	.set	TMP1,		%ymm1
-	.set	TMP1_XMM,	%xmm1
-	.set	TMP2,		%ymm2
-	.set	TMP2_XMM,	%xmm2
-	.set	LO,		%ymm3
-	.set	LO_XMM,		%xmm3
-	.set	MI,		%ymm4
-	.set	MI_XMM,		%xmm4
-	.set	GHASH_ACC,	%ymm5
-	.set	GHASH_ACC_XMM,	%xmm5
-	.set	BSWAP_MASK,	%ymm6
-	.set	BSWAP_MASK_XMM,	%xmm6
-	.set	GFPOLY,		%ymm7
-	.set	GFPOLY_XMM,	%xmm7
-	.set	H_POW2_XORED,	%ymm8
-	.set	H_POW1_XORED,	%ymm9
-
-	// Load the bswap_mask and gfpoly constants.  Since AADLEN is usually
-	// small, usually only 128-bit vectors will be used.  So as an
-	// optimization, don't broadcast these constants to both 128-bit lanes
-	// quite yet.
-	vmovdqu		.Lbswap_mask(%rip), BSWAP_MASK_XMM
-	vmovdqu		.Lgfpoly(%rip), GFPOLY_XMM
-
-	// Load the GHASH accumulator.
-	vmovdqu		(GHASH_ACC_PTR), GHASH_ACC_XMM
-
-	// Check for the common case of AADLEN <= 16, as well as AADLEN == 0.
-	test		AADLEN, AADLEN
-	jz		.Laad_done
-	cmp		$16, AADLEN
-	jle		.Laad_lastblock
-
-	// AADLEN > 16, so we'll operate on full vectors.  Broadcast bswap_mask
-	// and gfpoly to both 128-bit lanes.
-	vinserti128	$1, BSWAP_MASK_XMM, BSWAP_MASK, BSWAP_MASK
-	vinserti128	$1, GFPOLY_XMM, GFPOLY, GFPOLY
-
-	// If AADLEN >= 128, update GHASH with 128 bytes of AAD at a time.
-	add		$-128, AADLEN	// 128 is 4 bytes, -128 is 1 byte
-	jl		.Laad_loop_4x_done
-	vmovdqu		OFFSETOF_H_POWERS_XORED(KEY), H_POW2_XORED
-	vmovdqu		OFFSETOF_H_POWERS_XORED+32(KEY), H_POW1_XORED
-.Laad_loop_4x:
-	_ghash_4x	AAD
-	sub		$-128, AAD
-	add		$-128, AADLEN
-	jge		.Laad_loop_4x
-.Laad_loop_4x_done:
-
-	// If AADLEN >= 32, update GHASH with 32 bytes of AAD at a time.
-	add		$96, AADLEN
-	jl		.Laad_loop_1x_done
-.Laad_loop_1x:
-	vmovdqu		(AAD), TMP0
-	vpshufb		BSWAP_MASK, TMP0, TMP0
-	vpxor		TMP0, GHASH_ACC, GHASH_ACC
-	vmovdqu		OFFSETOFEND_H_POWERS-32(KEY), TMP0
-	_ghash_mul	TMP0, GHASH_ACC, GHASH_ACC, GFPOLY, TMP1, TMP2, LO
-	vextracti128	$1, GHASH_ACC, TMP0_XMM
-	vpxor		TMP0_XMM, GHASH_ACC_XMM, GHASH_ACC_XMM
-	add		$32, AAD
-	sub		$32, AADLEN
-	jge		.Laad_loop_1x
-.Laad_loop_1x_done:
-	add		$32, AADLEN
-	// Now 0 <= AADLEN < 32.
-
-	jz		.Laad_done
-	cmp		$16, AADLEN
-	jle		.Laad_lastblock
-
-	// Update GHASH with the remaining 17 <= AADLEN <= 31 bytes of AAD.
-	mov		AADLEN, AADLEN	// Zero-extend AADLEN to AADLEN64.
-	vmovdqu		(AAD), TMP0_XMM
-	vmovdqu		-16(AAD, AADLEN64), TMP1_XMM
-	vpshufb		BSWAP_MASK_XMM, TMP0_XMM, TMP0_XMM
-	vpxor		TMP0_XMM, GHASH_ACC_XMM, GHASH_ACC_XMM
-	lea		.Lrshift_and_bswap_table(%rip), %rax
-	vpshufb		-16(%rax, AADLEN64), TMP1_XMM, TMP1_XMM
-	vinserti128	$1, TMP1_XMM, GHASH_ACC, GHASH_ACC
-	vmovdqu		OFFSETOFEND_H_POWERS-32(KEY), TMP0
-	_ghash_mul	TMP0, GHASH_ACC, GHASH_ACC, GFPOLY, TMP1, TMP2, LO
-	vextracti128	$1, GHASH_ACC, TMP0_XMM
-	vpxor		TMP0_XMM, GHASH_ACC_XMM, GHASH_ACC_XMM
-	jmp		.Laad_done
-
-.Laad_lastblock:
-	// Update GHASH with the remaining 1 <= AADLEN <= 16 bytes of AAD.
-	_load_partial_block	AAD, TMP0_XMM, %r8, %r8d
-	vpshufb		BSWAP_MASK_XMM, TMP0_XMM, TMP0_XMM
-	vpxor		TMP0_XMM, GHASH_ACC_XMM, GHASH_ACC_XMM
-	vmovdqu		OFFSETOFEND_H_POWERS-16(KEY), TMP0_XMM
-	_ghash_mul	TMP0_XMM, GHASH_ACC_XMM, GHASH_ACC_XMM, GFPOLY_XMM, \
-			TMP1_XMM, TMP2_XMM, LO_XMM
-
-.Laad_done:
-	// Store the updated GHASH accumulator back to memory.
-	vmovdqu		GHASH_ACC_XMM, (GHASH_ACC_PTR)
-
-	vzeroupper
-	RET
-SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
-
 // Do one non-last round of AES encryption on the blocks in the given AESDATA
 // vectors using the round key that has been broadcast to all 128-bit lanes of
 // \round_key.
@@ -659,9 +377,11 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 .endr
 .endm
 
-// void aes_gcm_{enc,dec}_update_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
-//					   const u32 le_ctr[4], u8 ghash_acc[16],
-//					   const u8 *src, u8 *dst, int datalen);
+// void aes_gcm_{enc,dec}_update_vaes_avx2(u8 *dst, const u8 *src,
+//					   size_t datalen,
+//					   struct polyval_elem *ghash_acc,
+//					   const __be32 ctr32[4],
+//					   const struct aes_gcm_key *key);
 //
 // This macro generates a GCM encryption or decryption update function with the
 // above prototype (with \enc selecting which one).  The function computes the
@@ -674,29 +394,26 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 // any length.  The caller must do any buffering needed to ensure this.  Both
 // in-place and out-of-place en/decryption are supported.
 //
-// |le_ctr| must give the current counter in little-endian format.  This
-// function loads the counter from |le_ctr| and increments the loaded counter as
-// needed, but it does *not* store the updated counter back to |le_ctr|.  The
-// caller must update |le_ctr| if any more data segments follow.  Internally,
-// only the low 32-bit word of the counter is incremented, following the GCM
-// standard.
+// |ctr32| must give the current counter in big-endian format.  This function
+// loads the counter from |ctr32| and increments the loaded counter as needed,
+// but it does *not* store the updated counter back to |ctr32|.  The caller must
+// update |ctr32| if any more data segments follow.  Internally, only the low
+// 32-bit word of the counter is incremented, following the GCM standard.
 .macro	_aes_gcm_update	enc
 
 	// Function arguments
-	.set	KEY,		%rdi
-	.set	LE_CTR_PTR,	%rsi
-	.set	LE_CTR_PTR32,	%esi
-	.set	GHASH_ACC_PTR,	%rdx
-	.set	SRC,		%rcx	// Assumed to be %rcx.
+	.set	DST,		%rdi
+	.set	SRC,		%rsi
+	.set	DATALEN,	%rdx
+	.set	DATALEN32,	%edx
+	.set	GHASH_ACC_PTR,	%rcx	// Assumed to be %rcx.
 					// See .Ltail_xor_and_ghash_1to16bytes
-	.set	DST,		%r8
-	.set	DATALEN,	%r9d
-	.set	DATALEN64,	%r9	// Zero-extend DATALEN before using!
+	.set	BE_CTR_PTR,	%r8
+	.set	BE_CTR_PTR32,	%r8d
+	.set	KEY,		%r9
 
-	// Additional local variables
-
-	// %rax is used as a temporary register.  LE_CTR_PTR is also available
-	// as a temporary register after the counter is loaded.
+	// Additional local variables.
+	// %rax is used as a temporary register.
 
 	// AES key length in bytes
 	.set	AESKEYLEN,	%r10d
@@ -730,8 +447,8 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 	.set	MI,		%ymm6
 	.set	MI_XMM,		%xmm6
 
-	// H_POW[2-1]_XORED contain cached values from KEY->h_powers_xored.  The
-	// descending numbering reflects the order of the key powers.
+	// H_POW[2-1]_XORED contain cached values from KEY->ghash.k.h_powers_xored.
+	// The descending numbering reflects the order of the key powers.
 	.set	H_POW2_XORED,	%ymm7
 	.set	H_POW2_XORED_XMM, %xmm7
 	.set	H_POW1_XORED,	%ymm8
@@ -761,7 +478,8 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 
 	// Load the GHASH accumulator and the starting counter.
 	vmovdqu		(GHASH_ACC_PTR), GHASH_ACC_XMM
-	vbroadcasti128	(LE_CTR_PTR), LE_CTR
+	vbroadcasti128	(BE_CTR_PTR), LE_CTR
+	vpshufb		BSWAP_MASK, LE_CTR, LE_CTR
 
 	// Load the AES key length in bytes.
 	movl		OFFSETOF_AESKEYLEN(KEY), AESKEYLEN
@@ -857,9 +575,9 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 
 	// Make POWERS_PTR point to the key powers [H^N, H^(N-1), ...] where N
 	// is the number of blocks that remain.
-	.set		POWERS_PTR, LE_CTR_PTR	// LE_CTR_PTR is free to be reused.
-	.set		POWERS_PTR32, LE_CTR_PTR32
-	mov		DATALEN, %eax
+	.set		POWERS_PTR, BE_CTR_PTR	// BE_CTR_PTR is free to be reused.
+	.set		POWERS_PTR32, BE_CTR_PTR32
+	mov		DATALEN32, %eax
 	neg		%rax
 	and		$~15, %rax  // -round_up(DATALEN, 16)
 	lea		OFFSETOFEND_H_POWERS(KEY,%rax), POWERS_PTR
@@ -924,7 +642,7 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 	// Load a vpshufb mask that will right-shift by '32 - DATALEN' bytes
 	// (shifting in zeroes), then reflect all 16 bytes.
 	lea		.Lrshift_and_bswap_table(%rip), %rax
-	vmovdqu		-16(%rax, DATALEN64), TMP2_XMM
+	vmovdqu		-16(%rax, DATALEN), TMP2_XMM
 
 	// Move the second keystream block to its own register and left-align it
 	vextracti128	$1, AESDATA0, AESDATA1_XMM
@@ -936,18 +654,18 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 	// input data: the full ciphertext block and the zero-padded partial
 	// ciphertext block, both byte-reflected, in AESDATA0.
 .if \enc
-	vpxor		-16(SRC, DATALEN64), AESDATA1_XMM, AESDATA1_XMM
+	vpxor		-16(SRC, DATALEN), AESDATA1_XMM, AESDATA1_XMM
 	vpxor		(SRC), AESDATA0_XMM, AESDATA0_XMM
-	vmovdqu		AESDATA1_XMM, -16(DST, DATALEN64)
+	vmovdqu		AESDATA1_XMM, -16(DST, DATALEN)
 	vmovdqu		AESDATA0_XMM, (DST)
 	vpshufb		TMP2_XMM, AESDATA1_XMM, AESDATA1_XMM
 	vpshufb		BSWAP_MASK_XMM, AESDATA0_XMM, AESDATA0_XMM
 .else
-	vmovdqu		-16(SRC, DATALEN64), TMP1_XMM
+	vmovdqu		-16(SRC, DATALEN), TMP1_XMM
 	vmovdqu		(SRC), TMP0_XMM
 	vpxor		TMP1_XMM, AESDATA1_XMM, AESDATA1_XMM
 	vpxor		TMP0_XMM, AESDATA0_XMM, AESDATA0_XMM
-	vmovdqu		AESDATA1_XMM, -16(DST, DATALEN64)
+	vmovdqu		AESDATA1_XMM, -16(DST, DATALEN)
 	vmovdqu		AESDATA0_XMM, (DST)
 	vpshufb		TMP2_XMM, TMP1_XMM, AESDATA1_XMM
 	vpshufb		BSWAP_MASK_XMM, TMP0_XMM, AESDATA0_XMM
@@ -961,16 +679,17 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 	// Handle 1 <= DATALEN <= 16.  Carefully load and store the
 	// possibly-partial block, which we mustn't access out of bounds.
 	vmovdqu		(POWERS_PTR), TMP2_XMM
-	mov		SRC, KEY	// Free up %rcx, assuming SRC == %rcx
-	mov		DATALEN, %ecx
-	_load_partial_block	KEY, TMP0_XMM, POWERS_PTR, POWERS_PTR32
+	mov		GHASH_ACC_PTR, KEY	// Free up %rcx, assuming GHASH_ACC_PTR == %rcx
+	mov		DATALEN32, %ecx
+	_load_partial_block	SRC, TMP0_XMM, POWERS_PTR, POWERS_PTR32
 	vpxor		TMP0_XMM, AESDATA0_XMM, AESDATA0_XMM
-	mov		DATALEN, %ecx
+	mov		DATALEN32, %ecx
 	_store_partial_block	AESDATA0_XMM, DST, POWERS_PTR, POWERS_PTR32
+	mov		KEY, GHASH_ACC_PTR
 .if \enc
 	lea		.Lselect_high_bytes_table(%rip), %rax
 	vpshufb		BSWAP_MASK_XMM, AESDATA0_XMM, AESDATA0_XMM
-	vpand		(%rax, DATALEN64), AESDATA0_XMM, AESDATA0_XMM
+	vpand		(%rax, DATALEN), AESDATA0_XMM, AESDATA0_XMM
 .else
 	vpshufb		BSWAP_MASK_XMM, TMP0_XMM, AESDATA0_XMM
 .endif
@@ -997,151 +716,9 @@ SYM_FUNC_END(aes_gcm_aad_update_vaes_avx2)
 	RET
 .endm
 
-// void aes_gcm_enc_final_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
-//				    const u32 le_ctr[4], u8 ghash_acc[16],
-//				    u64 total_aadlen, u64 total_datalen);
-// bool aes_gcm_dec_final_vaes_avx2(const struct aes_gcm_key_vaes_avx2 *key,
-//				    const u32 le_ctr[4], const u8 ghash_acc[16],
-//				    u64 total_aadlen, u64 total_datalen,
-//				    const u8 tag[16], int taglen);
-//
-// This macro generates one of the above two functions (with \enc selecting
-// which one).  Both functions finish computing the GCM authentication tag by
-// updating GHASH with the lengths block and encrypting the GHASH accumulator.
-// |total_aadlen| and |total_datalen| must be the total length of the additional
-// authenticated data and the en/decrypted data in bytes, respectively.
-//
-// The encryption function then stores the full-length (16-byte) computed
-// authentication tag to |ghash_acc|.  The decryption function instead loads the
-// expected authentication tag (the one that was transmitted) from the 16-byte
-// buffer |tag|, compares the first 4 <= |taglen| <= 16 bytes of it to the
-// computed tag in constant time, and returns true if and only if they match.
-.macro	_aes_gcm_final	enc
-
-	// Function arguments
-	.set	KEY,		%rdi
-	.set	LE_CTR_PTR,	%rsi
-	.set	GHASH_ACC_PTR,	%rdx
-	.set	TOTAL_AADLEN,	%rcx
-	.set	TOTAL_DATALEN,	%r8
-	.set	TAG,		%r9
-	.set	TAGLEN,		%r10d	// Originally at 8(%rsp)
-	.set	TAGLEN64,	%r10
-
-	// Additional local variables.
-	// %rax and %xmm0-%xmm3 are used as temporary registers.
-	.set	AESKEYLEN,	%r11d
-	.set	AESKEYLEN64,	%r11
-	.set	GFPOLY,		%xmm4
-	.set	BSWAP_MASK,	%xmm5
-	.set	LE_CTR,		%xmm6
-	.set	GHASH_ACC,	%xmm7
-	.set	H_POW1,		%xmm8
-
-	// Load some constants.
-	vmovdqa		.Lgfpoly(%rip), GFPOLY
-	vmovdqa		.Lbswap_mask(%rip), BSWAP_MASK
-
-	// Load the AES key length in bytes.
-	movl		OFFSETOF_AESKEYLEN(KEY), AESKEYLEN
-
-	// Set up a counter block with 1 in the low 32-bit word.  This is the
-	// counter that produces the ciphertext needed to encrypt the auth tag.
-	// GFPOLY has 1 in the low word, so grab the 1 from there using a blend.
-	vpblendd	$0xe, (LE_CTR_PTR), GFPOLY, LE_CTR
-
-	// Build the lengths block and XOR it with the GHASH accumulator.
-	// Although the lengths block is defined as the AAD length followed by
-	// the en/decrypted data length, both in big-endian byte order, a byte
-	// reflection of the full block is needed because of the way we compute
-	// GHASH (see _ghash_mul_step).  By using little-endian values in the
-	// opposite order, we avoid having to reflect any bytes here.
-	vmovq		TOTAL_DATALEN, %xmm0
-	vpinsrq		$1, TOTAL_AADLEN, %xmm0, %xmm0
-	vpsllq		$3, %xmm0, %xmm0	// Bytes to bits
-	vpxor		(GHASH_ACC_PTR), %xmm0, GHASH_ACC
-
-	// Load the first hash key power (H^1), which is stored last.
-	vmovdqu		OFFSETOFEND_H_POWERS-16(KEY), H_POW1
-
-	// Load TAGLEN if decrypting.
-.if !\enc
-	movl		8(%rsp), TAGLEN
-.endif
-
-	// Make %rax point to the last AES round key for the chosen AES variant.
-	lea		OFFSETOF_AESROUNDKEYS+6*16(KEY,AESKEYLEN64,4), %rax
-
-	// Start the AES encryption of the counter block by swapping the counter
-	// block to big-endian and XOR-ing it with the zero-th AES round key.
-	vpshufb		BSWAP_MASK, LE_CTR, %xmm0
-	vpxor		OFFSETOF_AESROUNDKEYS(KEY), %xmm0, %xmm0
-
-	// Complete the AES encryption and multiply GHASH_ACC by H^1.
-	// Interleave the AES and GHASH instructions to improve performance.
-	cmp		$24, AESKEYLEN
-	jl		128f	// AES-128?
-	je		192f	// AES-192?
-	// AES-256
-	vaesenc		-13*16(%rax), %xmm0, %xmm0
-	vaesenc		-12*16(%rax), %xmm0, %xmm0
-192:
-	vaesenc		-11*16(%rax), %xmm0, %xmm0
-	vaesenc		-10*16(%rax), %xmm0, %xmm0
-128:
-.irp i, 0,1,2,3,4,5,6,7,8
-	_ghash_mul_step	\i, H_POW1, GHASH_ACC, GHASH_ACC, GFPOLY, \
-			%xmm1, %xmm2, %xmm3
-	vaesenc		(\i-9)*16(%rax), %xmm0, %xmm0
-.endr
-	_ghash_mul_step	9, H_POW1, GHASH_ACC, GHASH_ACC, GFPOLY, \
-			%xmm1, %xmm2, %xmm3
-
-	// Undo the byte reflection of the GHASH accumulator.
-	vpshufb		BSWAP_MASK, GHASH_ACC, GHASH_ACC
-
-	// Do the last AES round and XOR the resulting keystream block with the
-	// GHASH accumulator to produce the full computed authentication tag.
-	//
-	// Reduce latency by taking advantage of the property vaesenclast(key,
-	// a) ^ b == vaesenclast(key ^ b, a).  I.e., XOR GHASH_ACC into the last
-	// round key, instead of XOR'ing the final AES output with GHASH_ACC.
-	//
-	// enc_final then returns the computed auth tag, while dec_final
-	// compares it with the transmitted one and returns a bool.  To compare
-	// the tags, dec_final XORs them together and uses vptest to check
-	// whether the result is all-zeroes.  This should be constant-time.
-	// dec_final applies the vaesenclast optimization to this additional
-	// value XOR'd too.
-.if \enc
-	vpxor		(%rax), GHASH_ACC, %xmm1
-	vaesenclast	%xmm1, %xmm0, GHASH_ACC
-	vmovdqu		GHASH_ACC, (GHASH_ACC_PTR)
-.else
-	vpxor		(TAG), GHASH_ACC, GHASH_ACC
-	vpxor		(%rax), GHASH_ACC, GHASH_ACC
-	vaesenclast	GHASH_ACC, %xmm0, %xmm0
-	lea		.Lselect_high_bytes_table(%rip), %rax
-	vmovdqu		(%rax, TAGLEN64), %xmm1
-	vpshufb		BSWAP_MASK, %xmm1, %xmm1 // select low bytes, not high
-	xor		%eax, %eax
-	vptest		%xmm1, %xmm0
-	sete		%al
-.endif
-	// No need for vzeroupper here, since only used xmm registers were used.
-	RET
-.endm
-
 SYM_FUNC_START(aes_gcm_enc_update_vaes_avx2)
 	_aes_gcm_update	1
 SYM_FUNC_END(aes_gcm_enc_update_vaes_avx2)
 SYM_FUNC_START(aes_gcm_dec_update_vaes_avx2)
 	_aes_gcm_update	0
 SYM_FUNC_END(aes_gcm_dec_update_vaes_avx2)
-
-SYM_FUNC_START(aes_gcm_enc_final_vaes_avx2)
-	_aes_gcm_final	1
-SYM_FUNC_END(aes_gcm_enc_final_vaes_avx2)
-SYM_FUNC_START(aes_gcm_dec_final_vaes_avx2)
-	_aes_gcm_final	0
-SYM_FUNC_END(aes_gcm_dec_final_vaes_avx2)
